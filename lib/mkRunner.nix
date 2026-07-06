@@ -403,6 +403,10 @@ pkgs.writeShellApplication {
       KERNEL_PARAMS="$KERNEL_PARAMS llmjail.net_filter=1"
     fi
 
+    if USER_UID=''${EUID:-$(id -u)} && [[ -n "$USER_UID" ]]; then
+      KERNEL_PARAMS="$KERNEL_PARAMS llmjail.user_uid=$USER_UID"
+    fi
+
     # ── Store disk image ────────────────────────────────────────────
     DISK_ARGS=()
     if [ "$STORE_DISK" -gt 0 ]; then

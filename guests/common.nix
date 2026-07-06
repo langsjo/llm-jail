@@ -153,6 +153,26 @@
       extraGroups = [ "tty" "dialout" "systemd-journal" ];
     };
 
+    users.mutableUsers = true;
+    systemd.services.llmjail-set-user-uid = {
+      wantedBy = [ "llmjail-mounts.service" ];
+      before = [ "llmjail-mounts.service" ];
+      script = ''
+        USER_UID=""
+        for arg in $(cat /proc/cmdline); do
+          case "$arg" in
+            llmjail.user_uid=*) USER_UID="''${arg#llmjail.user_uid=}" ;;
+          esac
+        done
+        if [[ -n "$USER_UID" && "$USER_UID" -ge 1000 ]] && ! ${pkgs.getent}/bin/getent passwd "$USER_UID"; then
+          ${pkgs.shadow}/bin/usermod -u "$USER_UID" user
+        fi
+      '';
+      serviceConfig = {
+        Type = "oneshot";
+      };
+    };
+
     # ── llmjail-mounts service ───────────────────────────────────────────
     # Parses kernel cmdline for llmjail.mounts=tag0:/path:rw,tag1:/path:ro,...
     # and mounts each entry via 9p.
