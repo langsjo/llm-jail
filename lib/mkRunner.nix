@@ -371,8 +371,12 @@ pkgs.writeShellApplication {
     if [ -d /run/current-system/sw ]; then
       add_mount "/run/current-system/sw" "/host-sw" "ro"
     fi
-    if [ -d "/etc/profiles/per-user/$(whoami)" ]; then
-      add_mount "/etc/profiles/per-user/$(whoami)" "/host-user-sw" "ro"
+
+    # whoami from nixpkgs coreutils won't work on non-NixOS systems that have the user come from
+    # sssd and don't have nscd/nsncd enabled
+    USERNAME=$(whoami 2>/dev/null) || USERNAME="$USER"
+    if [ -n "$USERNAME" ] && [ -d "/etc/profiles/per-user/$USERNAME" ]; then
+      add_mount "/etc/profiles/per-user/$USERNAME" "/host-user-sw" "ro"
     fi
 
     # User extra mounts
