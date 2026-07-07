@@ -309,6 +309,9 @@ pkgs.writeShellApplication {
       add_mount "$(pwd)" "/workspace" "ro-nocache"
     else
       add_mount "$(pwd)" "/workspace" "rw"
+      if [[ -d "$(pwd)/.git/hooks" ]]; then
+        add_mount "$(pwd)/.git/hooks" "/workspace/.git/hooks" "ro-nocache"
+      fi
     fi
 
     validate_path "$CONFIG_DIR" "config directory"
