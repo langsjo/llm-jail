@@ -3,6 +3,11 @@
 {
   imports = [ ./common.nix ];
 
+  environment.extraInit = /* sh */ ''
+    [ -d /host-sw/bin ] && export PATH="/host-sw/bin:$PATH"
+    [ -d /host-user-sw/bin ] && export PATH="/host-user-sw/bin:$PATH"
+  '';
+
   llmjail.toolBinary = pkgs.writeShellScript "shell-launcher" ''
     # Create an empty $HOME/.zshrc in the jail, so that zsh doesn't complain about it
     ensure_zshrc() {

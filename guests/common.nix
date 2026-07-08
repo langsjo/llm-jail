@@ -280,6 +280,20 @@
       diffutils
       dnsmasq
       nftables
+    ] ++ map (p: p.terminfo) [
+      alacritty
+      contour
+      foot
+      ghostty
+      kitty
+      mtm
+      rio
+      rxvt-unicode-unwrapped
+      rxvt-unicode-unwrapped-emoji
+      st
+      tmux
+      wezterm
+      yaft
     ];
 
     # ── llmjail-net-filter service ─────────────────────────────────────
