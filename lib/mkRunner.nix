@@ -220,7 +220,6 @@ pkgs.writeShellApplication {
     }
     CLEANUP_FUNCS+=(cleanup_winch)
 
-    # ── Write env file ────────────────────────────────────────────────
     WORKSPACE_DIR="/workspace"
     if [[ "$SAME_PATH" -eq 1 ]]; then
       WORKSPACE_DIR="$(pwd)"
