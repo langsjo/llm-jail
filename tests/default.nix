@@ -86,6 +86,9 @@ let
             machine.succeed("nix-instantiate --eval -E '<nixpkgs>'")
         with subtest("user can read kernel journal"):
             machine.succeed("su - user -c 'journalctl -k --no-pager -n 1'")
+
+        with subtest("browser session is gated off by default"):
+            machine.fail("systemctl is-active cage-tty1.service")
       '';
     };
 
@@ -150,6 +153,77 @@ let
     '';
   };
 
+  # Boots the lightest guest with llmjail.browser=1 (the feature is
+  # tool-agnostic) and checks the cage/Chromium session comes up with a
+  # reachable CDP endpoint. The test driver runs headless; a virtio-vga
+  # device still gives the guest the DRM node cage needs, no host display
+  # required. Chromium under TCG (CI has no KVM) is slow, hence the
+  # generous CDP timeout.
+  browserTest = pkgs.testers.nixosTest {
+    name = "llmjail-browser-smoke";
+
+    nodes.machine = { lib, ... }: {
+      imports = [ ../guests/shell.nix ];
+      _module.args = { inherit nixpkgs nixpkgs-rolling; };
+
+      fileSystems."/.nix-lower/store" = lib.mkForce {
+        device = "tmpfs";
+        fsType = "tmpfs";
+        options = [ "size=1M" ];
+      };
+      fileSystems."/llmjail-env" = lib.mkForce {
+        device = "tmpfs";
+        fsType = "tmpfs";
+        options = [ "size=10M" ];
+      };
+      boot.initrd.postMountCommands = lib.mkForce "";
+
+      # Enable the browser session via kernel cmdline, like --browser does.
+      boot.kernelParams = lib.mkAfter [ "llmjail.browser=1" ];
+
+      # The runner normally 9p-mounts the browser state dir; stand it in
+      # with a plain directory.
+      systemd.tmpfiles.rules = [
+        "d /workspace 0755 user users -"
+        "d /home/user/.llmjail-browser 0755 user users -"
+        "f /llmjail-env/env 0644 root root - HOME=/home/user"
+        "f /llmjail-env/tool-args 0644 root root -"
+        "f /llmjail-env/allowed-domains 0644 root root -"
+      ];
+
+      systemd.services.llmjail-tool = {
+        wantedBy = lib.mkForce [ ];
+        serviceConfig.ExecStopPost = lib.mkForce "";
+      };
+
+      virtualisation.qemu.options = [
+        "-device virtio-vga"
+        "-device virtio-keyboard-pci"
+        "-device virtio-tablet-pci"
+      ];
+      virtualisation.memorySize = 3072;
+    };
+
+    testScript = ''
+      machine.start()
+      machine.wait_for_unit("multi-user.target")
+
+      with subtest("cage session starts"):
+          machine.wait_for_unit("cage-tty1.service")
+
+      with subtest("chromium is available"):
+          machine.succeed("which chromium")
+
+      with subtest("CDP endpoint comes up"):
+          machine.wait_until_succeeds(
+              "curl -sf http://127.0.0.1:9222/json/version", timeout=600
+          )
+
+      with subtest("chromium writes its profile to the state dir"):
+          machine.succeed('test -n "$(ls -A /home/user/.llmjail-browser)"')
+    '';
+  };
+
 in
 {
   claude-smoke = mkSmokeTest {
@@ -189,6 +263,8 @@ in
   };
 
   net-filter-smoke = netFilterTest;
+
+  browser-smoke = browserTest;
 }
 // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isx86_64 {
   autolith-smoke = mkSmokeTest {

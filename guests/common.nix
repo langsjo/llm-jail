@@ -1,6 +1,8 @@
 { config, lib, pkgs, nixpkgs-rolling, ... }:
 
 {
+  imports = [ ./browser.nix ];
+
   options.llmjail = {
     toolBinary = lib.mkOption {
       type = lib.types.either lib.types.str lib.types.package;

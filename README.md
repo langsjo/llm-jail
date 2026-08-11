@@ -98,7 +98,8 @@ llm-jail-{claude,codex,copilot,opencode,autolith,pi,shell} [options] [-- tool-ar
 | `--store-disk SIZE` | Create a disk-backed /nix overlay (SIZE in GB) | off |
 | `--allow-domain DOMAIN` | Add domain to network whitelist (repeatable) | tool defaults |
 | `--no-net-filter` | Disable network filtering (unrestricted access) | filtering on |
-| `--mem SIZE` | VM memory in MB | 4096 |
+| `--browser` | Visible in-VM Chromium in a host window, CDP on guest `127.0.0.1:9222` (see [Browser mode](#browser-mode)) | off |
+| `--mem SIZE` | VM memory in MB | 4096 (6144 with `--browser`) |
 | `--vcpu COUNT` | Number of vCPUs | 2 |
 | `-h`, `--help` | Show help | - |
 
@@ -164,6 +165,29 @@ nix run .#shell -- --no-net-filter           # full network for debugging
 ```
 
 The shell tool honors `$SHELL` (resolved through symlinks so the `/nix/store` path is used) and falls back to zsh or bash if the host shell isn't reachable inside the guest (e.g. on non-NixOS hosts). Shell rc files are not copied in; bring anything you need with `--ro-mount`.
+
+## Browser mode
+
+`--browser` boots the same VM with a visible Chromium next to the tool, shown as a single window on your desktop (a QEMU GTK window running a cage kiosk session - no desktop environment, just the browser). The tool's TUI stays on the terminal. Inside the guest the browser exposes the Chrome DevTools Protocol on `127.0.0.1:9222`; nothing is forwarded to the host network. Use it to watch an agent browse in real time and to intervene by hand - click through captchas, complete logins - in a browser that never leaves the sandbox. Requires a graphical session (`WAYLAND_DISPLAY` or `DISPLAY`).
+
+The flag is harness-agnostic: llm-jail only provides the browser and its CDP endpoint, and you point your harness at it. For oh-my-pi, drop a settings overlay into its jail-private state dir once and pass it per run (the `--config` path is the **guest** path):
+
+```bash
+mkdir -p ~/.config/llm-jail/omp/default
+printf 'browser:\n  cdpUrl: "http://127.0.0.1:9222"\n' > ~/.config/llm-jail/omp/default/cdp.yaml
+
+nix run .#omp -- --browser -- --config /home/user/.omp/cdp.yaml
+```
+
+(Alternatively set `browser.cdpUrl` permanently in the jail's omp config - but then runs without `--browser` have no endpoint to attach to and the browser tool errors instead of falling back to headless.)
+
+Details:
+
+- **State.** The browser profile (cookies, logins, captcha clearances) persists on the host in `~/.config/llm-jail/browser/<profile>` - deliberately **not** under a tool's state dir, so it survives switching harnesses. Solve a captcha once and it sticks.
+- **Network.** The domain filter applies to the browser like everything else: only whitelisted domains, ports 80/443, no QUIC (UDP 443 is dropped; the browser is started with `--disable-quic` so it doesn't stall). For general browsing combine with `--allow-domain` or `--no-net-filter`. Note that a browser fully driven by the agent is inherently a bidirectional channel - the exfiltration caution from the dangerous-mode section applies.
+- **Window.** Closing the window does *not* end the session (`window-close=off`) - the VM quits when the tool exits or on Ctrl-a x; the window's Machine → Power Down menu also shuts down cleanly. Resizing the window resizes the guest display. There is no host<->guest clipboard sync; type into the window directly.
+- **Other tools.** The flag works with every runner; a harness without CDP wiring simply ignores the browser (handy anyway for a hand-driven sandboxed browser session).
+- **Debugging.** `nix run .#shell -- --browser`, then inside the shell: `systemctl status cage-tty1`, `journalctl -u cage-tty1 -b`, `ls /dev/dri`, `curl -s http://127.0.0.1:9222/json/version`. Boot text in the window but no browser means a cage/session problem; an entirely black window points at host GTK/QEMU.
 
 ## What's isolated
 
@@ -251,6 +275,9 @@ Default allowed domains per tool:
 |    -> llmjail-mounts: mount 9p shares          |
 |    -> llmjail-net-filter: dnsmasq + nftables   |
 |    -> llmjail-tool: exec the tool binary       |
+|    -> cage-tty1: Chromium kiosk, CDP :9222     |
+|       (only with --browser; drawn in a host    |
+|        GTK window via virtio-vga)              |
 |                                                |
 |  ExecStopPost: poweroff when tool exits        |
 +------------------------------------------------+

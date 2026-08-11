@@ -28,7 +28,9 @@ pkgs.writeShellApplication {
     set -euo pipefail
 
     MEM="${toString toolDefaults.mem}"
+    MEM_SET=0
     VCPU="${toString toolDefaults.vcpu}"
+    BROWSER=0
     DANGEROUS=0
     NIX_ENV=0
     DEVENV=0
@@ -79,6 +81,12 @@ pkgs.writeShellApplication {
       --store-disk SIZE     Create a disk-backed /nix overlay (SIZE in GB)
       --allow-domain DOMAIN Add domain to network whitelist (repeatable)
       --no-net-filter       Disable network filtering (unrestricted access)
+      --browser             Run a visible Chromium inside the VM, shown in a
+                             host window (QEMU GTK). CDP listens on
+                             127.0.0.1:9222 in the guest; configure your
+                             harness to attach to it. Browser state persists
+                             in <state-dir>/browser/<profile>, shared across
+                             tools. Raises the default --mem to 6144.
       --mem SIZE            Memory in MB (default: ${toString toolDefaults.mem})
       --vcpu COUNT          vCPUs (default: ${toString toolDefaults.vcpu})
       -h, --help            Show this help
@@ -121,9 +129,10 @@ pkgs.writeShellApplication {
         --same-path)   SAME_PATH=1; shift ;;
         --allow-domain)  EXTRA_DOMAINS+=("$2"); shift 2 ;;
         --no-net-filter) NET_FILTER=0; shift ;;
+        --browser)     BROWSER=1; shift ;;
         --mask)        MASK_PATTERNS+=("$2"); shift 2 ;;
         --store-disk)  STORE_DISK="$2"; shift 2 ;;
-        --mem)         MEM="$2"; shift 2 ;;
+        --mem)         MEM="$2"; MEM_SET=1; shift 2 ;;
         --vcpu)        VCPU="$2"; shift 2 ;;
         -h|--help)     usage ;;
         --)            shift; TOOL_ARGS=("$@"); break ;;
@@ -131,12 +140,31 @@ pkgs.writeShellApplication {
       esac
     done
 
+    if [ "$BROWSER" = "1" ]; then
+      if [ -z "''${WAYLAND_DISPLAY:-}" ] && [ -z "''${DISPLAY:-}" ]; then
+        echo "ERROR: --browser needs a graphical session (neither WAYLAND_DISPLAY nor DISPLAY is set)" >&2
+        exit 1
+      fi
+      if ! qemu-system-${arch} -display help | grep -qw gtk; then
+        echo "ERROR: this QEMU build has no GTK display support (needed for --browser)" >&2
+        exit 1
+      fi
+      # Chromium plus compositor need headroom; only bump when the user
+      # didn't pick a size themselves.
+      if [ "$MEM_SET" = "0" ] && [ "$MEM" -lt 6144 ]; then
+        MEM=6144
+      fi
+    fi
+
     # Jail-private tool state, fully separate from the host tool's own
     # config dir. --state-dir / LLMJAIL_STATE_DIR overrides the default
     # jail state root (~/.config/llm-jail); <tool>/<profile> is appended.
     if [ -z "$STATE_DIR" ]; then
       STATE_DIR="''${XDG_CONFIG_HOME:-$HOME/.config}/llm-jail"
     fi
+    # Browser state is harness-independent (browser/<profile>, not under
+    # <tool>/) so cookies and logins survive switching tools.
+    BROWSER_STATE_DIR="$STATE_DIR/browser/$PROFILE"
     STATE_DIR="$STATE_DIR/${name}/$PROFILE"
 
     if [ ! -d "$LLMJAIL_TMPDIR" ]; then
@@ -419,6 +447,12 @@ pkgs.writeShellApplication {
     mkdir -p "$STATE_DIR"
     add_mount "$STATE_DIR" "/home/user/${toolDefaults.configDirName}" "rw"
 
+    if [ "$BROWSER" = "1" ]; then
+      validate_path "$BROWSER_STATE_DIR" "browser state directory"
+      mkdir -p "$BROWSER_STATE_DIR"
+      add_mount "$BROWSER_STATE_DIR" "/home/user/.llmjail-browser" "rw"
+    fi
+
     # Copy .gitconfig into the envfs share (9p can't mount single files)
     if [ -f "$HOME/.gitconfig" ]; then
       cp "$HOME/.gitconfig" "$RUNDIR/.gitconfig"
@@ -496,6 +530,10 @@ pkgs.writeShellApplication {
       KERNEL_PARAMS="$KERNEL_PARAMS llmjail.net_filter=1"
     fi
 
+    if [ "$BROWSER" = "1" ]; then
+      KERNEL_PARAMS="$KERNEL_PARAMS llmjail.browser=1"
+    fi
+
     if USER_UID=''${EUID:-$(id -u)} && [[ -n "$USER_UID" ]]; then
       KERNEL_PARAMS="$KERNEL_PARAMS llmjail.user_uid=$USER_UID"
     fi
@@ -521,6 +559,25 @@ pkgs.writeShellApplication {
       KVM_ARGS+=("-cpu" "max")
     fi
 
+    # Headless by default. --browser adds a virtio-vga (the DRM device the
+    # guest's cage session renders to) and shows it in a GTK window on the
+    # host. The window contains only the guest display - the TUI stays on
+    # the terminal, its stdio mux wiring untouched. window-close=off: the
+    # window's X button must not kill the VM mid-session; quit via tool
+    # exit or Ctrl-a x (the GTK Machine menu's Power Down also works).
+    # virtio-tablet provides absolute pointer coords so the host cursor
+    # maps 1:1 into the window without pointer grabbing.
+    DISPLAY_ARGS=(-display none)
+    if [ "$BROWSER" = "1" ]; then
+      DISPLAY_ARGS=(
+        "-device" "virtio-vga,xres=1280,yres=800"
+        "-display" "gtk,window-close=off"
+        "-device" "virtio-keyboard-pci"
+        "-device" "virtio-tablet-pci"
+        "-name" "llm-jail-${name}"
+      )
+    fi
+
     # socat itself retries the UNIX-CONNECT until QEMU binds the socket,
     # so no polling loop is needed.
     socat -u "PIPE:$WINSIZE_FIFO" "UNIX-CONNECT:$WINSIZE_SOCK,retry=100,interval=0.1" 2>/dev/null &
@@ -538,6 +595,8 @@ pkgs.writeShellApplication {
     #
     # -display none (not -nographic): we wire stdio explicitly via the mux
     # chardev; -nographic assumes a single serial-on-stdio and conflicts.
+    # (--browser swaps DISPLAY_ARGS to a GTK window + virtio-vga; the
+    # stdio/mux wiring below is identical either way.)
     # Two serials are kept so the kernel `console=ttyS1` resolves: ttyS0=null
     # (unused now that the tool is on hvc0), ttyS1 -> kernel.log. Without
     # ttyS1 present the console falls back to hvc0 and a getty grabs it.
@@ -562,7 +621,7 @@ pkgs.writeShellApplication {
       -kernel ${toplevel}/kernel \
       -initrd ${toplevel}/initrd \
       -append "$KERNEL_PARAMS" \
-      -display none \
+      "''${DISPLAY_ARGS[@]}" \
       -chardev stdio,id=cons0,mux=on,signal=off \
       -mon chardev=cons0,mode=readline \
       -device virtio-serial-pci \
