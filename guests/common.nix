@@ -11,11 +11,16 @@ let
   roBootShare = device: {
     inherit device;
     fsType = if config.llmjail.virtiofs then "virtiofs" else "9p";
+    # A 9p/virtiofs mount has no device unit to wait for, and it fails if udev has
+    # not bound the virtio device yet, which drops the initrd into emergency mode.
     options =
-      if config.llmjail.virtiofs then
-        [ "ro" ]
-      else
-        [ "trans=virtio" "version=9p2000.L" "cache=loose" "msize=1048576" "ro" ];
+      [ "x-systemd.after=systemd-udev-settle.service" ]
+      ++ (
+        if config.llmjail.virtiofs then
+          [ "ro" ]
+        else
+          [ "trans=virtio" "version=9p2000.L" "cache=loose" "msize=1048576" "ro" ]
+      );
     neededForBoot = true;
   };
 in
@@ -120,6 +125,12 @@ in
     # `mount -t overlay`, so make it explicit.
     boot.initrd.kernelModules = [ "overlay" ];
     boot.kernelModules = [ "nf_tables" "virtio_console" ];
+
+    # roBootShare mounts are ordered after this unit, which the initrd neither
+    # ships nor starts by default. Pulled in here rather than with
+    # x-systemd.requires, which would also apply to the same mounts in stage 2.
+    boot.initrd.systemd.additionalUpstreamUnits = [ "systemd-udev-settle.service" ];
+    boot.initrd.systemd.services.systemd-udev-settle.wantedBy = [ "initrd-fs.target" ];
 
     boot.initrd.supportedFilesystems = [ "ext4" ];
 

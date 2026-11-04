@@ -5,60 +5,110 @@ on:
     - cron: "0 6 * * *" # daily at 06:00 UTC
   workflow_dispatch:
 
+concurrency:
+  group: update-flake-inputs
+  cancel-in-progress: true
+
+env:
+  BRANCH: auto-update-flake-inputs
+
 jobs:
   update:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
-      - uses: actions/create-github-app-token@v2
-        id: app-token
-        with:
-          app-id: ${{ secrets.APP_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
-
       - uses: actions/checkout@v7
 
       - uses: cachix/install-nix-action@v31
 
-      - name: Update flake inputs
-        run: |
-          {
-            nix flake update nixpkgs-rolling
-            nix flake update claude-code-nix
-            nix flake update codex-cli-nix
-            nix flake update llm-agents
-            nix flake update autolith
-            nix flake update nix-omp
-          } 2>&1 | tee /tmp/update-output.txt
-          {
-            echo "UPDATE_OUTPUT<<EOF"
-            cat /tmp/update-output.txt
-            echo "EOF"
-          } >> "$GITHUB_ENV"
+      # Ubuntu's AppArmor strips capabilities from unprivileged user
+      # namespaces, which virtiofsd --sandbox=namespace needs
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
-      - name: Create pull request
-        id: create-pr
-        uses: peter-evans/create-pull-request@v8
-        with:
-          token: ${{ steps.app-token.outputs.token }}
-          sign-commits: true
-          commit-message: |
-            flake: update nixpkgs-rolling, claude-code-nix, codex-cli-nix, llm-agents.nix, nix-omp, and autolith inputs
-
-            ${{ env.UPDATE_OUTPUT }}
-          title: "flake: update nixpkgs-rolling, claude-code-nix, codex-cli-nix, llm-agents.nix, nix-omp, and autolith inputs"
-          body: |
-            Automated daily update of flake inputs:
-            - `nixpkgs-rolling`
-            - `claude-code-nix`
-            - `codex-cli-nix`
-            - `llm-agents.nix`
-            - `autolith`
-            - `nix-omp`
-          branch: auto-update-flake-inputs
-          delete-branch: true
-
-      - name: Enable auto-merge
-        if: steps.create-pr.outputs.pull-request-operation == 'created'
+      - name: Configure attic
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: gh pr merge --auto --squash "${{ steps.create-pr.outputs.pull-request-number }}"
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: |
+          nix profile add --impure --expr \
+            "(builtins.getFlake (toString ./.)).inputs.nixpkgs.legacyPackages.$(uname -m)-linux.attic-client"
+          attic login main https://cache.langsjo.dev "$ATTIC_TOKEN"
+          attic use main
+
+      - name: Update flake inputs
+        id: update
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+
+          inputs=(nixpkgs-rolling claude-code-nix codex-cli-nix llm-agents autolith)
+          # The guest's base nixpkgs only moves weekly, on Sundays
+          if [ "$(date -u +%u)" = 7 ]; then
+            inputs+=(nixpkgs)
+          fi
+
+          nix flake update "${inputs[@]}" \
+            --commit-lock-file \
+            --option commit-lockfile-summary 'flake: update inputs'
+
+          if git diff --quiet "origin/$GITHUB_REF_NAME"; then
+            echo "update_available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "update_available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Must run before the checks: anything they build locally would no longer
+      # show up in the dry-run, and so would never be pushed to the cache
+      - name: List uncached derivations
+        if: steps.update.outputs.update_available == 'true'
+        run: |
+          nix eval .#packages.x86_64-linux --apply builtins.attrNames --json \
+            | jq -r '.[] | ".#packages.x86_64-linux.\(.).virtiofs"' > /tmp/packages.txt
+          mapfile -t packages < /tmp/packages.txt
+
+          if ! nix_build_output=$(nix build "${packages[@]}" --dry-run 2>&1 >/dev/null); then
+            printf "%s" "$nix_build_output"
+            exit 1
+          fi
+
+          # Skip preferLocalBuild derivations, consumers build those themselves anyway
+          if ! awk '
+                /these [0-9]+ paths will be fetched/{exit}
+                /these [0-9]+ derivations will be built/{next}
+                {print}
+            ' <<< "$nix_build_output" \
+            | grep '\.drv$' \
+            | xargs grep -vlE '\\"preferLocalBuild\\":true|\("preferLocalBuild","1"\)' > /tmp/build_drvs.txt
+          then
+            echo "Seemingly no derivations to be built; output from dry-run:"
+            printf "%s\n" "$nix_build_output"
+          fi
+
+      - name: Run flake checks
+        if: steps.update.outputs.update_available == 'true'
+        run: nix flake check --print-build-logs
+
+      - name: Build packages with virtiofs
+        if: steps.update.outputs.update_available == 'true'
+        run: |
+          mapfile -t packages < /tmp/packages.txt
+          nix build "${packages[@]}" --no-link --print-build-logs
+
+      - name: Push to cache
+        if: steps.update.outputs.update_available == 'true'
+        run: |
+          if [ -s /tmp/build_drvs.txt ]; then
+            xargs nix-store --query --outputs < /tmp/build_drvs.txt | attic push main --stdin
+          fi
+
+      - name: Create and merge pull request
+        if: steps.update.outputs.update_available == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git push --force --set-upstream origin "$BRANCH"
+          gh pr create --base "$GITHUB_REF_NAME" --head "$BRANCH" --fill
+          gh pr merge "$BRANCH" --squash --delete-branch
