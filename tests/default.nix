@@ -24,46 +24,59 @@ let
         # Provide mock envfs contents for the mounts service
         systemd.tmpfiles.rules = [
           "d /workspace 0755 user users -"
-          "f /llmjail-env/env 0644 root root - HOME=/home/user"
+          "f /llmjail-env/env 0644 root root - export HOME=/home/user"
           "f /llmjail-env/tool-args 0644 root root -"
           "f /llmjail-env/allowed-domains 0644 root root -"
+          "f /llmjail-env/authorized_keys 0644 root root - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITEST test"
         ];
 
-        # Tool service will fail without credentials - prevent it from
-        # blocking boot or powering off the VM.
-        systemd.services.llmjail-tool = {
-          wantedBy = lib.mkForce [ ];
-          serviceConfig.ExecStopPost = lib.mkForce "";
-        };
+        # The test VM has no llmjail.ssh port; the unit would wait for the
+        # device and then power the VM off.
+        systemd.services.llmjail-sshd.wantedBy = lib.mkForce [ ];
 
         virtualisation.memorySize = 1024;
       };
 
-      testScript = ''
+      testScript = { nodes, ... }: ''
         machine.start()
         machine.wait_for_unit("multi-user.target")
 
-        with subtest("tool binary exists"):
+        with subtest("tool binary and launcher exist"):
             machine.succeed("test -x ${toolBinary}")
+            machine.succeed("test -x ${nodes.machine.config.llmjail.launcher}")
 
-        with subtest("systemd services are defined"):
-            machine.succeed("systemctl cat llmjail-mounts.service")
-            machine.succeed("systemctl cat llmjail-net-filter.service")
-            machine.succeed("systemctl cat llmjail-tool.service")
-            machine.succeed("systemctl cat llmjail-winsize.service")
-
-        with subtest("winsize service is running"):
-            machine.succeed("systemctl is-active llmjail-winsize.service")
-
-        with subtest("mounts service handles no-mounts case"):
+        with subtest("setup units are done and the session gate is open"):
             machine.succeed("systemctl is-active llmjail-mounts.service")
+            machine.succeed("systemctl is-active llmjail-net-filter.service")
+            machine.succeed("systemctl is-active llmjail-ready.target")
 
-        with subtest("tool service has correct configuration"):
-            output = machine.succeed(
-                "systemctl show llmjail-tool.service -p User,WorkingDirectory"
-            )
-            assert "User=user" in output, f"Expected User=user in: {output}"
-            assert "WorkingDirectory=!/workspace" in output, f"Expected WorkingDirectory=!/workspace in: {output}"
+        with subtest("sshd allows only key login as user"):
+            # lower(): newer OpenSSH prints the keywords in CamelCase
+            output = machine.succeed("sshd -T -f /etc/ssh/sshd_config").lower()
+            for line in ["passwordauthentication no", "permitrootlogin no", "allowusers user", "permituserrc no"]:
+                assert line in output.splitlines(), f"Expected '{line}' in sshd -T output: {output}"
+            keyfile = [l for l in output.splitlines() if l.startswith("authorizedkeysfile")]
+            assert keyfile and ".ssh/authorized_keys" not in keyfile[0], f"Unexpected authorizedkeysfile: {keyfile}"
+
+        with subtest("authorized key is installed root-owned and read-only"):
+            output = machine.succeed("stat -c '%a %U' /etc/ssh/authorized_keys.d/user")
+            assert output.strip() == "444 root", f"Unexpected mode/owner: {output}"
+
+        with subtest("sshd listens nowhere inside the guest"):
+            machine.fail("systemctl is-active sshd.service")
+            tcp = [l for l in machine.succeed("ss -Htln").splitlines() if not l.split()[3].endswith(":53")]
+            assert not tcp, f"Unexpected TCP listeners: {tcp}"
+            output = machine.succeed("ss -Hlxp")
+            assert "sshd" not in output, f"Unexpected sshd unix listener: {output}"
+            output = machine.succeed("systemctl list-units --all --plain --no-legend --state=active,listening 'sshd-*.socket'")
+            assert output.strip() == "", f"Unexpected ssh generator sockets: {output}"
+
+        with subtest("failures power the VM off"):
+            for unit in ["llmjail-mounts", "llmjail-net-filter"]:
+                output = machine.succeed(f"systemctl show -p FailureAction {unit}.service")
+                assert output.strip() == "FailureAction=poweroff-force", f"{unit}: {output}"
+            output = machine.succeed("systemctl show -p ExecStopPost llmjail-sshd.service")
+            assert "poweroff" in output, f"Expected poweroff in ExecStopPost: {output}"
 
         with subtest("common packages are available"):
             machine.succeed("which git")
@@ -111,15 +124,12 @@ let
 
       systemd.tmpfiles.rules = [
         "d /workspace 0755 user users -"
-        "f /llmjail-env/env 0644 root root - HOME=/home/user"
+        "f /llmjail-env/env 0644 root root - export HOME=/home/user"
         "f /llmjail-env/tool-args 0644 root root -"
         "f+ /llmjail-env/allowed-domains 0644 root root - api.anthropic.com"
       ];
 
-      systemd.services.llmjail-tool = {
-        wantedBy = lib.mkForce [ ];
-        serviceConfig.ExecStopPost = lib.mkForce "";
-      };
+      systemd.services.llmjail-sshd.wantedBy = lib.mkForce [ ];
 
       virtualisation.memorySize = 1024;
     };
@@ -180,15 +190,12 @@ let
 
       systemd.tmpfiles.rules = [
         "d /workspace 0755 user users -"
-        "f /llmjail-env/env 0644 root root - HOME=/home/user"
+        "f /llmjail-env/env 0644 root root - export HOME=/home/user"
         "f /llmjail-env/tool-args 0644 root root -"
         "f /llmjail-env/allowed-domains 0644 root root -"
       ];
 
-      systemd.services.llmjail-tool = {
-        wantedBy = lib.mkForce [ ];
-        serviceConfig.ExecStopPost = lib.mkForce "";
-      };
+      systemd.services.llmjail-sshd.wantedBy = lib.mkForce [ ];
 
       virtualisation.memorySize = 1536;
     };
@@ -219,6 +226,47 @@ let
 
       with subtest("compose plugin is available"):
           machine.succeed("su - user -c 'docker compose version'")
+    '';
+  };
+
+  # A setup unit that fails must power the VM off instead of opening a session.
+  failFastTest = pkgs.testers.nixosTest {
+    name = "llmjail-fail-fast-smoke";
+
+    nodes.machine = { lib, ... }: {
+      imports = [ ../guests/shell.nix ];
+      _module.args = { inherit nixpkgs nixpkgs-rolling; };
+
+      fileSystems."/.nix-lower/store" = lib.mkForce {
+        device = "tmpfs";
+        fsType = "tmpfs";
+        options = [ "size=1M" ];
+      };
+      fileSystems."/llmjail-env" = lib.mkForce {
+        device = "tmpfs";
+        fsType = "tmpfs";
+        options = [ "size=10M" ];
+      };
+
+      # A share whose tag QEMU does not provide makes llmjail-mounts fail.
+      boot.kernelParams = lib.mkAfter [ "llmjail.mounts=nosuchtag:/x:rw" ];
+
+      systemd.tmpfiles.rules = [
+        "d /workspace 0755 user users -"
+        "f /llmjail-env/env 0644 root root - export HOME=/home/user"
+        "f /llmjail-env/tool-args 0644 root root -"
+        "f /llmjail-env/allowed-domains 0644 root root -"
+      ];
+
+      systemd.services.llmjail-sshd.wantedBy = lib.mkForce [ ];
+
+      virtualisation.memorySize = 1024;
+    };
+
+    testScript = ''
+      machine.start()
+      machine.wait_for_console_text("Failed to start .*llmjail host shares")
+      machine.wait_for_shutdown()
     '';
   };
 
@@ -263,6 +311,8 @@ in
   net-filter-smoke = netFilterTest;
 
   docker-smoke = dockerTest;
+
+  fail-fast-smoke = failFastTest;
 }
 // import ./runner.nix { inherit pkgs shell; }
 // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isx86_64 {

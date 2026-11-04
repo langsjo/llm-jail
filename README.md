@@ -102,7 +102,15 @@ llm-jail-{claude,codex,copilot,opencode,autolith,pi,shell} [options] [-- tool-ar
 | `--vcpu COUNT` | Number of vCPUs | 2 |
 | `-h`, `--help` | Show help | - |
 
-Press **Ctrl-a x** to force-quit QEMU at any time.
+Press **Enter**, **~**, **.** to end the session; the VM shuts down.
+
+### Inspecting a running jail
+
+At startup the runner prints an `ssh -F <rundir>/ssh_config jail`
+command. Running it in another terminal opens a shell as `user` in
+the same VM. That shell closes when the tool session ends, and it
+runs as the same user as the agent, so treat what it shows as
+something the agent could have changed.
 
 ### Nix build-time 'arguments'
 Some features may need to be added at build-time for the VM itself, and can thus not be enabled with
@@ -290,7 +298,8 @@ Default allowed domains per tool:
 |    - writes env vars + tool args to tmpdir     |
 |    - sets up 9p (or virtiofs) mounts           |
 |    - optionally creates root disk image        |
-|    - launches qemu-system-*                    |
+|    - launches qemu-system-* in the background  |
+|    - ssh master over a virtio-serial port      |
 +------------------+-----------------------------+
                    | QEMU (direct kernel boot)
 +-- Guest (NixOS) -+-----------------------------+
@@ -301,13 +310,13 @@ Default allowed domains per tool:
 |  systemd                                       |
 |    -> llmjail-mounts: mount host shares        |
 |    -> llmjail-net-filter: dnsmasq + nftables   |
-|    -> llmjail-tool: exec the tool binary       |
+|    -> llmjail-sshd: sshd -i -> tool launcher   |
 |                                                |
-|  ExecStopPost: poweroff when tool exits        |
+|  ExecStopPost: poweroff when ssh closes        |
 +------------------------------------------------+
 ```
 
-No persistent disk images are involved. The guest kernel and initrd are built by NixOS and passed to QEMU via `-kernel` / `-initrd`. The host Nix store is shared read-only over 9p (or virtiofs with the `virtiofs` build-time argument) and used directly as the lower layer of a `/nix/store` overlay whose upper layer lives on the root filesystem. The root is a tmpfs by default; with `--disk` it is a sparse ext4 image instead, so everything the guest writes outside the host mounts (new store paths, `/nix/var/nix/builds/`, `$HOME` caches, Docker images) lands on disk rather than in RAM. The image is cleaned up automatically when the VM exits.
+No persistent disk images are involved. The guest kernel and initrd are built by NixOS and passed to QEMU via `-kernel` / `-initrd`. The host Nix store is shared read-only over 9p (or virtiofs with the `virtiofs` build-time argument) and used directly as the lower layer of a `/nix/store` overlay whose upper layer lives on the root filesystem. The root is a tmpfs by default; with `--disk` it is a sparse ext4 image instead, so everything the guest writes outside the host mounts (new store paths, `/nix/var/nix/builds/`, `$HOME` caches, Docker images) lands on disk rather than in RAM. The image is cleaned up automatically when the VM exits. If the VM fails to boot or the connection is lost, the runner prints the QEMU log and the tail of the guest's kernel and journal log.
 
 ## Overriding tool packages
 

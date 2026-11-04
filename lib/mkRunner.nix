@@ -22,12 +22,15 @@ pkgs.writeShellApplication {
     pkgs.util-linux
     pkgs.nix
     pkgs.e2fsprogs
-    pkgs.pv
+    pkgs.openssh
     pkgs.socat
     pkgs.sqlite
   ]
   ++ (lib.optional (flags ? devenv) pkgs.devenv)
   ++ (lib.optional (flags ? virtiofs) pkgs.virtiofsd);
+  # The cleanup_* functions are only called indirectly, through CLEANUP_FUNCS
+  # and the EXIT trap, which shellcheck cannot follow.
+  excludeShellChecks = [ "SC2329" ];
   text = ''
     set -euo pipefail
 
@@ -89,7 +92,8 @@ pkgs.writeShellApplication {
       --vcpu COUNT          vCPUs (default: ${toString toolDefaults.vcpu})
       -h, --help            Show this help
 
-    Press Ctrl-a x to force-quit QEMU.
+    Press Enter ~ . to end the session (the VM shuts down). The runner
+    prints an ssh command for opening inspection shells in the jail.
     USAGE
       exit 0
     }
@@ -153,7 +157,8 @@ pkgs.writeShellApplication {
     fi
 
     # Paths used in virtfs option strings (comma-separated) and kernel cmdline
-    # (space-separated) cannot contain commas, spaces, or colons (mount spec delimiter).
+    # (space-separated) cannot contain commas, spaces, or colons (mount spec delimiter),
+    # nor '%', which ssh expands in ssh_config values.
     validate_path() {
       local path="$1" label="''${2:-path}"
       if [[ "$path" == *,* ]]; then
@@ -168,6 +173,41 @@ pkgs.writeShellApplication {
         echo "ERROR: $label must not contain colons: $path" >&2
         exit 1
       fi
+      if [[ "$path" == *%* ]]; then
+        echo "ERROR: $label must not contain '%': $path" >&2
+        exit 1
+      fi
+    }
+
+    # Unix socket paths are limited to 107 bytes. EXTRA covers bytes a tool
+    # appends (ssh adds 17 to the ControlPath while creating it).
+    check_socket_path() {
+      local path="$1" extra="''${2:-0}"
+      if (( ''${#path} + extra > 107 )); then
+        echo "ERROR: socket path too long (max 107 bytes): $path; use --tmpdir with a shorter path" >&2
+        exit 1
+      fi
+    }
+
+    # ssh runs ProxyCommand through $SHELL -c; never let the user's shell
+    # (fish, nu, or the runner test's probe) run the master's proxy.
+    jail_ssh() {
+      SHELL=${pkgs.runtimeShell} ${pkgs.openssh}/bin/ssh -F "$RUNDIR/ssh_config" "$@"
+    }
+
+    # Printed only when the VM fails to boot or the connection is lost.
+    print_guest_logs() {
+      local log
+      for log in "$RUNDIR/qemu.log" "$RUNDIR"/virtiofsd-*.log; do
+        if [ -s "$log" ]; then
+          echo "--- ''${log##*/} ---" >&2
+          cat "$log" >&2
+        fi
+      done
+      if [ -f "$RUNDIR/guest.log" ]; then
+        echo "--- guest.log (last 200 lines) ---" >&2
+        tail -n 200 "$RUNDIR/guest.log" >&2
+      fi
     }
 
     validate_path "$LLMJAIL_TMPDIR" "tmpdir"
@@ -178,75 +218,41 @@ pkgs.writeShellApplication {
     }
     CLEANUP_FUNCS+=(cleanup_rundir)
 
-    # TODO: QEMU has a pending patch series (v6, "console: add
-    # TIOCSWINSZ support") that adds native SIGWINCH->virtconsole
-    # forwarding. When those patches land upstream and reach nixpkgs,
-    # this entire side-channel (FIFO, socat bridge, virtio-serial
-    # chardev, and the guest llmjail-winsize service) can be dropped in
-    # favor of the resize flag on the virtconsole chardev itself.
-    #
-    # Until then we push "cols rows" lines through a dedicated
-    # virtio-serial port on every SIGWINCH; the guest applies them via
-    # TIOCSWINSZ on /dev/hvc0.
-    #
-    # bash defers trap handlers until a synchronous foreground child
-    # exits, so a dedicated subshell owns the SIGWINCH trap and parks in
-    # `sleep & wait` - wait's trap-interrupt semantics fire the trap
-    # promptly on each resize.
-    WINSIZE_SOCK="$RUNDIR/winsize.sock"
-    WINSIZE_FIFO="$RUNDIR/winsize.fifo"
-    mkfifo "$WINSIZE_FIFO"
-    # Hold the FIFO open RDWR on fd 3 so trap writes never block on
-    # "no writer" and the bridge never sees premature EOF.
-    exec 3<>"$WINSIZE_FIFO"
+    # Absolute: $RUNDIR is written into ssh_config and the printed command.
+    RUNDIR=$(realpath "$RUNDIR")
+    # $RUNDIR goes unquoted into the proxy command (run by $SHELL -c) and ssh_config.
+    if [[ ! "$RUNDIR" =~ ^[A-Za-z0-9._/+-]+$ ]]; then
+      echo "ERROR: tmpdir path contains characters ssh cannot use: $RUNDIR; use --tmpdir with a plain path" >&2
+      exit 1
+    fi
+    check_socket_path "$RUNDIR/ssh.sock"
+    check_socket_path "$RUNDIR/ctl.sock" 17
 
-    (
-      winsize_emit() {
-        # Read from /dev/tty explicitly: bash redirects an async command's
-        # stdin to /dev/null when job control is disabled (POSIX).
-        local size
-        size=$(stty size </dev/tty 2>/dev/null) || return 0
-        # stty size prints "rows cols"; the guest reader expects "cols rows".
-        printf '%s %s\n' "''${size##* }" "''${size%% *}" >&3 || true
-      }
-      trap winsize_emit WINCH
-      winsize_emit
-
-      # 'uninvoked function', but indirect call via trap
-      # shellcheck disable=SC2329
-      cleanup_sleep() {
-        if [ -n "''${SLEEP_PID:-}" ]; then
-          kill "$SLEEP_PID" 2>/dev/null || true
-          wait "$SLEEP_PID" 2>/dev/null || true
-        fi
-        exit
-      }
-      trap cleanup_sleep TERM
-      while :; do
-        sleep 86400 &
-        SLEEP_PID=$!
-        # wait(2) is interrupted by WINCH traps. Keep waiting for the same
-        # sleep PID until it actually exits, otherwise we'd leak sleepers.
-        while kill -0 "$SLEEP_PID" 2>/dev/null; do
-          wait "$SLEEP_PID" 2>/dev/null || true
-        done
-      done
-    ) &
-    WINCH_FWD_PID=$!
-    cleanup_winch() {
-      kill "$WINCH_FWD_PID" 2>/dev/null
+    # The ssh client and ssh-keygen need the user's passwd entry; nixpkgs-glibc
+    # whoami fails in the same case (e.g. sssd without nscd/nsncd).
+    USERNAME=$(whoami 2>/dev/null) || {
+      echo "ERROR: your user is not resolvable through nixpkgs' glibc (e.g. sssd without nscd/nsncd); the ssh client cannot run" >&2
+      exit 1
     }
-    CLEANUP_FUNCS+=(cleanup_winch)
+
+    # Only this directory is shared with the guest (envfs, at /llmjail-env).
+    SHAREDIR="$RUNDIR/share"
+    mkdir "$SHAREDIR"
 
     WORKSPACE_DIR="/workspace"
     if [[ "$SAME_PATH" -eq 1 ]]; then
       WORKSPACE_DIR="$(pwd)"
     fi
-    ENV_FILE="$RUNDIR/env"
+    # Sourced by the guest launcher: every value %q-quoted, so sourcing it
+    # exports the variables and never runs host-supplied text as code.
+    ENV_FILE="$SHAREDIR/env"
+    env_line() {
+      printf 'export %s=%q\n' "$1" "$2"
+    }
     {
       for var in ANTHROPIC_API_KEY ANTHROPIC_BASE_URL CLAUDE_CODE_MAX_OUTPUT_TOKENS OPENAI_API_KEY OPENAI_BASE_URL; do
         if [ -n "''${!var:-}" ]; then
-          echo "$var=\"''${!var}\""
+          env_line "$var" "''${!var}"
         fi
       done
 
@@ -256,38 +262,34 @@ pkgs.writeShellApplication {
       if [ -n "''${SHELL:-}" ]; then
         RESOLVED_SHELL=$(readlink -f "$SHELL" 2>/dev/null || true)
         if [ -n "$RESOLVED_SHELL" ]; then
-          echo "SHELL=\"$RESOLVED_SHELL\""
+          env_line SHELL "$RESOLVED_SHELL"
         fi
       fi
 
-      env | grep '^AWS_' || true
-
-      # Forward terminal type and dimensions so TUI apps render correctly
-      for var in TERM COLORTERM; do
-        if [ -n "''${!var:-}" ]; then
-          echo "$var=\"''${!var}\""
+      # Names only from well-formed lines; multi-line values can't inject names.
+      while IFS= read -r name; do
+        if [[ "$name" =~ ^AWS_[A-Za-z0-9_]*$ ]]; then
+          env_line "$name" "''${!name:-}"
         fi
-      done
-      if [ -z "''${TERM:-}" ]; then
-        echo "TERM=\"xterm-256color\""
-      fi
-      if STTY_SIZE=$(stty size 2>/dev/null); then
-        echo "LINES=''${STTY_SIZE%% *}"
-        echo "COLUMNS=''${STTY_SIZE##* }"
+      done < <(env | cut -d= -f1)
+
+      # TERM and the window size travel with ssh's pty request; COLORTERM does not.
+      if [ -n "''${COLORTERM:-}" ]; then
+        env_line COLORTERM "$COLORTERM"
       fi
 
-      echo "HOME=/home/user"
-      echo "LLMJAIL_DANGEROUS=$DANGEROUS"
+      env_line HOME /home/user
+      env_line LLMJAIL_DANGEROUS "$DANGEROUS"
       # Relocate the tool's state into the jail-private state mount
-      echo "${toolDefaults.configEnvVar}=/home/user/${toolDefaults.configDirName}"
-      echo "WORKSPACE_DIR=\"$WORKSPACE_DIR\""
+      env_line ${toolDefaults.configEnvVar} /home/user/${toolDefaults.configDirName}
+      env_line WORKSPACE_DIR "$WORKSPACE_DIR"
     } > "$ENV_FILE"
 
     # Write tool args as null-separated file to preserve argument boundaries
     if [ ''${#TOOL_ARGS[@]} -gt 0 ]; then
-      printf '%s\0' "''${TOOL_ARGS[@]}" > "$RUNDIR/tool-args"
+      printf '%s\0' "''${TOOL_ARGS[@]}" > "$SHAREDIR/tool-args"
     else
-      : > "$RUNDIR/tool-args"
+      : > "$SHAREDIR/tool-args"
     fi
 
     if [ "$NET_FILTER" = "1" ]; then
@@ -310,9 +312,9 @@ pkgs.writeShellApplication {
         for d in "''${EXTRA_DOMAINS[@]+"''${EXTRA_DOMAINS[@]}"}"; do
           echo "$d"
         done
-      } | sort -u > "$RUNDIR/allowed-domains"
+      } | sort -u > "$SHAREDIR/allowed-domains"
     else
-      : > "$RUNDIR/allowed-domains"
+      : > "$SHAREDIR/allowed-domains"
     fi
 
     if [ "$DEVENV" = "1" ] && ! command -v devenv >/dev/null; then
@@ -337,11 +339,11 @@ pkgs.writeShellApplication {
 
     if [ "$NIX_ENV" = "1" ]; then
       echo "Evaluating nix dev shell..." >&2
-      if nix print-dev-env --no-warn-dirty "$(pwd)" > "$RUNDIR/dev-env" 2>/dev/null; then
+      if nix print-dev-env --no-warn-dirty "$(pwd)" > "$SHAREDIR/dev-env" 2>/dev/null; then
         echo "Dev shell environment captured." >&2
       else
         echo "WARNING: nix print-dev-env failed, continuing without dev shell" >&2
-        rm -f "$RUNDIR/dev-env"
+        rm -f "$SHAREDIR/dev-env"
       fi
     elif [ "$DEVENV" = "1" ]; then
       echo "Evaluating devenv shell..." >&2
@@ -372,7 +374,7 @@ pkgs.writeShellApplication {
       # A dedicated scratch dir is used rather than $RUNDIR: the
       # workspace's own devenv.nix shellHook runs on the host as part of
       # `direnv-export` (same trust model as `nix develop`/
-      # `nix print-dev-env` on an untrusted flake), and $RUNDIR holds
+      # `nix print-dev-env` on an untrusted flake), and $SHAREDIR holds
       # allowed-domains/mask-patterns/tool-args/env - files the guest
       # treats as the trust boundary for its network allowlist and
       # secrets, staged there before this step runs. A shellHook that
@@ -383,12 +385,12 @@ pkgs.writeShellApplication {
         rm -rf "$DEVENV_RUNTIME_SCRATCH"
       }
       CLEANUP_FUNCS+=(cleanup_devenv_runtime_scratch)
-      if DEVENV_ERR=$(XDG_RUNTIME_DIR="$DEVENV_RUNTIME_SCRATCH" _DEVENV_CALLER=direnv devenv --no-tui -q direnv-export < /dev/null 2>&1 >"$RUNDIR/dev-env"); then
+      if DEVENV_ERR=$(XDG_RUNTIME_DIR="$DEVENV_RUNTIME_SCRATCH" _DEVENV_CALLER=direnv devenv --no-tui -q direnv-export < /dev/null 2>&1 >"$SHAREDIR/dev-env"); then
         echo "Dev shell environment captured." >&2
       else
         echo "WARNING: devenv shell failed, continuing without dev shell" >&2
         echo "$DEVENV_ERR" >&2
-        rm -f "$RUNDIR/dev-env"
+        rm -f "$SHAREDIR/dev-env"
       fi
     fi
 
@@ -410,14 +412,6 @@ pkgs.writeShellApplication {
       VIRTIOFSD_PIDS=()
       cleanup_virtiofsd() {
         kill "''${VIRTIOFSD_PIDS[@]+"''${VIRTIOFSD_PIDS[@]}"}" 2>/dev/null
-        # Surface virtiofsd errors before cleanup_rundir deletes the logs
-        local log
-        for log in "$RUNDIR"/virtiofsd-*.log; do
-          if [ -s "$log" ]; then
-            echo "''${log##*/}:" >&2
-            cat "$log" >&2
-          fi
-        done
       }
       CLEANUP_FUNCS+=(cleanup_virtiofsd)
 
@@ -471,10 +465,11 @@ pkgs.writeShellApplication {
       if [ "$tag" = "nix-store" ]; then
         args+=("--no-announce-submounts")
       fi
-      # Logged to a file, not the terminal: the tool's TUI owns the tty
-      # once QEMU starts. Printed by cleanup_virtiofsd after the VM exits.
+      # Logged to a file, not the terminal: the tool's session owns the tty
+      # once QEMU starts. Printed by print_guest_logs, only on failure.
       local log="$RUNDIR/virtiofsd-$tag.log"
-      virtiofsd "''${args[@]}" 2>"$log" &
+      # Own session: a Ctrl-C to the terminal's process group must not reach it.
+      setpriv --pdeathsig KILL -- setsid -- virtiofsd "''${args[@]}" 2>"$log" &
       VIRTIOFSD_PIDS+=($!)
 
       # QEMU fails outright if the socket isn't there yet
@@ -496,7 +491,7 @@ pkgs.writeShellApplication {
 
     # Not ro-immutable: host nix builds/GC change the store during the run
     add_share nix-store /nix/store ro
-    add_share envfs "$RUNDIR" ro-immutable
+    add_share envfs "$SHAREDIR" ro-immutable
 
     add_mount() {
       local hostpath="$1" guestpath="$2" mode="$3"
@@ -531,8 +526,30 @@ pkgs.writeShellApplication {
 
     # Copy .gitconfig into the envfs share (9p/virtiofs can't mount single files)
     if [ -f "$HOME/.gitconfig" ]; then
-      cp "$HOME/.gitconfig" "$RUNDIR/.gitconfig"
+      cp "$HOME/.gitconfig" "$SHAREDIR/.gitconfig"
     fi
+
+    # Per-run login key: the private half never leaves $RUNDIR, the public half
+    # is installed root-owned in the guest by llmjail-mounts.
+    ssh-keygen -q -t ed25519 -N "" -C llm-jail -f "$RUNDIR/id"
+    cp "$RUNDIR/id.pub" "$SHAREDIR/authorized_keys"
+
+    # ProxyCommand false: only the master gets the real proxy (on its command
+    # line), so any other client joins the master or fails at once instead of
+    # opening a second connection that nothing would answer. Host-key checking
+    # is off: the key changes every boot and the transport is private to us.
+    cat > "$RUNDIR/ssh_config" <<SSHCONFIG
+    Host jail
+      User user
+      ProxyCommand false
+      ControlPath $RUNDIR/ctl.sock
+      IdentityFile $RUNDIR/id
+      IdentitiesOnly yes
+      BatchMode yes
+      StrictHostKeyChecking no
+      UserKnownHostsFile /dev/null
+      LogLevel ERROR
+    SSHCONFIG
 
     # Snapshot the host nix db into the envfs share so the guest can register the whole host store
     # without replaying rows through `nix-store --load-db` (minutes for big stores). Uses `VACUUM
@@ -545,11 +562,11 @@ pkgs.writeShellApplication {
     # toplevel closure dump.
     NIX_DB_SNAPSHOT=""
     if [ -f /nix/var/nix/db/db.sqlite ]; then
-      rm -f "$RUNDIR/nix-db.sqlite"   # VACUUM INTO refuses an existing output file
-      if timeout 60 sqlite3 /nix/var/nix/db/db.sqlite "VACUUM INTO '$RUNDIR/nix-db.sqlite';" 2>/dev/null; then
+      rm -f "$SHAREDIR/nix-db.sqlite"   # VACUUM INTO refuses an existing output file
+      if timeout 60 sqlite3 /nix/var/nix/db/db.sqlite "VACUUM INTO '$SHAREDIR/nix-db.sqlite';" 2>/dev/null; then
         NIX_DB_SNAPSHOT="/llmjail-env/nix-db.sqlite"
       else
-        rm -f "$RUNDIR/nix-db.sqlite" # VACUUM INTO may leave a partial file on failure
+        rm -f "$SHAREDIR/nix-db.sqlite" # VACUUM INTO may leave a partial file on failure
         echo "WARNING: could not snapshot host nix db, falling back to closure dump" >&2
       fi
     fi
@@ -559,9 +576,6 @@ pkgs.writeShellApplication {
       add_mount "/run/current-system/sw" "/host-sw" "ro"
     fi
 
-    # whoami from nixpkgs coreutils won't work on non-NixOS systems that have the user come from
-    # sssd and don't have nscd/nsncd enabled
-    USERNAME=$(whoami 2>/dev/null) || USERNAME="$USER"
     if [ -n "$USERNAME" ] && [ -d "/etc/profiles/per-user/$USERNAME" ]; then
       add_mount "/etc/profiles/per-user/$USERNAME" "/host-user-sw" "ro"
     fi
@@ -593,14 +607,14 @@ pkgs.writeShellApplication {
       esac
     done
     if [ ''${#MASK_PATTERNS[@]} -gt 0 ]; then
-      printf '%s\n' "''${MASK_PATTERNS[@]}" > "$RUNDIR/mask-patterns"
+      printf '%s\n' "''${MASK_PATTERNS[@]}" > "$SHAREDIR/mask-patterns"
     else
-      : > "$RUNDIR/mask-patterns"
+      : > "$SHAREDIR/mask-patterns"
     fi
     if [ ''${#MASK_ROOTS[@]} -gt 0 ]; then
-      printf '%s\n' "''${MASK_ROOTS[@]}" > "$RUNDIR/mask-roots"
+      printf '%s\n' "''${MASK_ROOTS[@]}" > "$SHAREDIR/mask-roots"
     else
-      : > "$RUNDIR/mask-roots"
+      : > "$SHAREDIR/mask-roots"
     fi
 
     KERNEL_PARAMS="$(cat ${toplevel}/kernel-params) init=${toplevel}/init llmjail.mounts=$MOUNT_CMDLINE"
@@ -644,41 +658,20 @@ pkgs.writeShellApplication {
       KVM_ARGS+=("-cpu" "max")
     fi
 
-    # socat itself retries the UNIX-CONNECT until QEMU binds the socket,
-    # so no polling loop is needed.
-    socat -u "PIPE:$WINSIZE_FIFO" "UNIX-CONNECT:$WINSIZE_SOCK,retry=100,interval=0.1" 2>/dev/null &
-    SOCAT_PID=$!
-    cleanup_socat() {
-      kill "$SOCAT_PID" 2>/dev/null
-    }
-    CLEANUP_FUNCS+=(cleanup_socat)
-
-    # hvc0 (virtio-console) instead of ttyS0 (16550A): the UART transfers
-    # output byte-at-a-time through port IO + per-byte interrupts, which
-    # stutters on full-screen TUI redraws. virtio-console moves bulk frame
-    # data over a virtqueue. SIGWINCH still works via the winsize side-channel
-    # (TIOCSWINSZ is tty-core, driver-independent).
+    # The tool's terminal is an ssh session over the llmjail.ssh virtserialport,
+    # which throttles instead of dropping data like virtconsole (see AGENTS.md).
     #
-    # -display none (not -nographic): we wire stdio explicitly via the mux
-    # chardev; -nographic assumes a single serial-on-stdio and conflicts.
-    # Route the kernel console to kernel.log: the first PL011 UART on ARM,
-    # or the second 16550A UART on x86. Keep it separate from the tool on hvc0.
-    #
-    # Console output pump. QEMU's virtconsole frontend silently DROPS guest
-    # output when the host-side chardev write would block (EAGAIN) - console
-    # ports are never throttled, unlike virtserialport ("rather than silently
-    # dropping console data on EAGAIN", QEMU hw/char/virtio-console.c; unfixed
-    # as of QEMU 11.0.1). TUI redraws burst whole frames (100KB+); a
-    # momentarily-full terminal pty (64KB) then loses part of the frame. The
-    # `| pv -q -B 64M` pipeline fixes this: pv drains QEMU's stdout eagerly
-    # into a 64MB buffer and writes to the terminal as it becomes writable,
-    # so the pipe QEMU writes to never stays full and the drop path is never
-    # hit. pv flushes small writes promptly (<=90ms), so interactive echo is
-    # unaffected. The pipeline is foreground: when QEMU exits, the pipe
-    # closes, EOF drains the tail, pv exits, and pipefail propagates QEMU's
-    # status - no FIFO, no background job, no cleanup.
+    # -display none (not -nographic): -nographic would put a serial port on stdio.
+    # Route the kernel console (and the forwarded journal) to guest.log: the first
+    # PL011 UART on ARM, or the second 16550A UART on x86.
     # ARM virt defaults to GICv2; max also supports hosts with GICv3-only KVM.
-    qemu-system-${arch} \
+    #
+    # QEMU runs in its own session so a Ctrl-C to the terminal's process group
+    # does not reach it (QEMU installs its own SIGINT handler, overriding the
+    # ignore bash gives background jobs). Bash runs without job control, so the
+    # job is not a group leader and setsid does not fork: $! stays QEMU's pid and
+    # the parent-death signal survives.
+    setpriv --pdeathsig KILL -- setsid -- qemu-system-${arch} \
       ${lib.optionalString pkgs.stdenv.hostPlatform.isAarch64 "-machine virt,gic-version=max"} \
       "''${KVM_ARGS[@]}" \
       -m "$MEM" \
@@ -687,19 +680,80 @@ pkgs.writeShellApplication {
       -initrd ${toplevel}/initrd \
       -append "$KERNEL_PARAMS" \
       -display none \
-      -chardev stdio,id=cons0,mux=on,signal=off \
-      -object monitor-hmp,id=mon0,chardev=cons0,readline=on \
+      -monitor none \
       -device virtio-serial-pci \
-      -device virtconsole,chardev=cons0,nr=0 \
-      -chardev "socket,id=winsize,path=$WINSIZE_SOCK,server=on,wait=off" \
-      -device virtserialport,chardev=winsize,name=llmjail.winsize \
+      -chardev "socket,id=ssh,path=$RUNDIR/ssh.sock,server=on,wait=off" \
+      -device virtserialport,chardev=ssh,name=llmjail.ssh \
       ${lib.optionalString pkgs.stdenv.hostPlatform.isx86_64 "-serial null"} \
-      -serial file:"$RUNDIR/kernel.log" \
+      -serial file:"$RUNDIR/guest.log" \
       -no-reboot \
       -device virtio-rng-pci \
       -nic user,model=virtio-net-pci \
       "''${SHARE_ARGS[@]}" \
       "''${DISK_ARGS[@]}" \
-      | pv -q -B 64M
+      </dev/null >"$RUNDIR/qemu.log" 2>&1 &
+    QEMU_PID=$!
+    cleanup_qemu() {
+      kill "$QEMU_PID" 2>/dev/null
+      wait "$QEMU_PID" 2>/dev/null
+    }
+    CLEANUP_FUNCS+=(cleanup_qemu)
+
+    # Registered after cleanup_qemu, so it runs first.
+    cleanup_master() {
+      jail_ssh -O exit jail 2>/dev/null || true
+    }
+    CLEANUP_FUNCS+=(cleanup_master)
+
+    # Ctrl-C ends ssh but not the runner, which then prints the logs (boot) or
+    # shuts down normally (session). INT only: SIGTERM to the runner alone keeps
+    # its default action and the EXIT cleanup kills QEMU.
+    trap ':' INT
+
+    echo "Booting VM…" >&2
+    # The master connects before the guest has booted, so no guest output is
+    # written while no client is connected; its login completing is the
+    # readiness signal. socat retries the connect until QEMU binds ssh.sock.
+    # ssh prefixes ProxyCommand with `exec` itself; setsid keeps the proxy out of
+    # the terminal's process group (ssh forks it before daemonizing).
+    proxy="${pkgs.util-linux}/bin/setsid ${pkgs.socat}/bin/socat - UNIX-CONNECT:$RUNDIR/ssh.sock,retry=50,interval=0.1"
+    if ! jail_ssh -f -M -N -o "ProxyCommand=$proxy" jail \
+         </dev/null >/dev/null 2>"$RUNDIR/ssh-master.log"; then
+      echo "VM did not become ready" >&2
+      if [ -s "$RUNDIR/ssh-master.log" ]; then
+        echo "--- ssh-master.log ---" >&2
+        cat "$RUNDIR/ssh-master.log" >&2
+      fi
+      print_guest_logs
+      exit 1
+    fi
+
+    echo "To open a shell in this jail: ${pkgs.openssh}/bin/ssh -F $RUNDIR/ssh_config jail" >&2
+
+    TTY_FLAG=-T
+    if [ -t 0 ] && [ -t 1 ]; then
+      TTY_FLAG=-t
+    fi
+    rc=0
+    jail_ssh "$TTY_FLAG" jail ${guest.config.llmjail.launcher} || rc=$?
+    trap - INT
+
+    if ! jail_ssh -O check jail 2>/dev/null; then
+      echo "lost connection to VM" >&2
+      print_guest_logs
+    fi
+    # Closing the master ends every session; the guest's sshd exits and its
+    # unit powers the VM off cleanly.
+    jail_ssh -O exit jail 2>/dev/null || true
+    for (( i=0; i < 75; i++ )); do
+      kill -0 "$QEMU_PID" 2>/dev/null || break
+      sleep 0.2
+    done
+    if kill -0 "$QEMU_PID" 2>/dev/null; then
+      echo "VM did not power off within 15 s; killing it" >&2
+      kill -KILL "$QEMU_PID" 2>/dev/null || true
+    fi
+    # ssh exits 255 after Enter ~ . and the runner passes that through.
+    exit "$rc"
   '';
 }

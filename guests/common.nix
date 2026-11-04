@@ -34,6 +34,61 @@ in
       default = [ ];
       description = "Domains added to the tool's default network whitelist by optional guest modules (read by mkRunner)";
     };
+    launcher = lib.mkOption {
+      type = lib.types.package;
+      readOnly = true;
+      description = "Script the runner executes over ssh to start the tool";
+      default = pkgs.writeShellScript "launch-tool" ''
+        # Source NixOS's global environment before modifying env vars. Must be sourced before
+        # `set -u` since some variables such as `XDG_STATE_HOME` may not be set.
+        source /etc/set-environment
+        # The runner's env file (`export NAME=<%q-quoted value>` lines). Sourced after
+        # set-environment so the host SHELL and the other forwarded values win.
+        # shellcheck disable=SC1091
+        source /llmjail-env/env
+
+        set -euo pipefail
+        # Add host packages to PATH if available (NixOS host)
+        if [ -d /host-user-sw/bin ]; then
+          export PATH="$PATH:/host-user-sw/bin"
+        fi
+        if [ -d /host-sw/bin ]; then
+          export PATH="$PATH:/host-sw/bin"
+        fi
+
+        # cd into the workspace before sourcing dev-env: devenv's shellHook
+        # can do its own relative-path checks (e.g. per-language module
+        # checks like `./foo/package.json`) that assume cwd is the project
+        # root, not wherever the ssh session started (the home directory,
+        # and the workspace path differs under --same-path).
+        cd "''${WORKSPACE_DIR:-/workspace}"
+
+        if [ -f /llmjail-env/dev-env ]; then
+          # dev-env is `nix print-dev-env` or `devenv direnv-export`
+          # output - a bash script setting PATH, etc. Neither is written
+          # to tolerate nounset/errexit, so relax strict mode just for
+          # the source.
+          set +euo pipefail
+          # shellcheck disable=SC1091
+          source /llmjail-env/dev-env
+          set -euo pipefail
+        fi
+
+        ARGS=()
+        if [ "''${LLMJAIL_DANGEROUS:-0}" = "1" ]; then
+          ARGS+=(${config.llmjail.dangerousFlag})
+        fi
+
+        # Read null-separated tool args preserving argument boundaries
+        if [ -s /llmjail-env/tool-args ]; then
+          while IFS= read -r -d "" arg; do
+            ARGS+=("$arg")
+          done < /llmjail-env/tool-args
+        fi
+
+        exec ${config.llmjail.toolBinary} "''${ARGS[@]}"
+      '';
+    };
     virtiofs = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -43,7 +98,14 @@ in
 
   config = {
     boot.loader.grub.enable = false;
-    boot.kernelParams = [ (if pkgs.stdenv.hostPlatform.isAarch64 then "console=ttyAMA0" else "console=ttyS1") ];
+    boot.kernelParams = [
+      (if pkgs.stdenv.hostPlatform.isAarch64 then "console=ttyAMA0" else "console=ttyS1")
+      # A guest panic reboots at once; -no-reboot turns that into a QEMU exit, so the
+      # runner's ssh master fails instead of hanging.
+      "panic=-1"
+      # No systemd-ssh-generator sockets (it would add a guest-local AF_UNIX sshd socket).
+      "systemd.ssh_auto=no"
+    ];
     boot.initrd.availableKernelModules = [
       "9p"
       "9pnet_virtio"
@@ -88,7 +150,7 @@ in
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
-        # Mirror stdout/stderr to kernel.log so failures
+        # Mirror stdout/stderr to guest.log so failures
         # are visible before we have journalctl. Drop after stabilizing.
         StandardOutput = "journal+console";
         StandardError = "journal+console";
@@ -142,7 +204,7 @@ in
       uid = 1000;
       home = "/home/user";
       shell = pkgs.bash;
-      extraGroups = [ "tty" "dialout" "systemd-journal" ];
+      extraGroups = [ "systemd-journal" ];
     };
 
     users.mutableUsers = true;
@@ -170,14 +232,25 @@ in
     systemd.services.llmjail-mounts = {
       description = "Mount llmjail host shares from kernel cmdline";
       wantedBy = [ "multi-user.target" ];
-      before = [ "llmjail-tool.service" ];
+      before = [ "llmjail-ready.target" ];
       after = [ "local-fs.target" ];
+      # A share or --mask that could not be applied must not leave the session
+      # running unprotected; poweroff-force still syncs.
+      unitConfig.FailureAction = "poweroff-force";
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
       };
       script = ''
         set -euo pipefail
+
+        # Per-run ssh key from the runner. Installed before the early exit
+        # below so it also happens without mounts (nixosTest nodes). Root-owned
+        # so sshd's StrictModes passes and the agent cannot edit it.
+        if [ -f /llmjail-env/authorized_keys ]; then
+          ${pkgs.coreutils}/bin/install -D -m 0444 -o root -g root \
+            /llmjail-env/authorized_keys /etc/ssh/authorized_keys.d/user
+        fi
 
         MOUNTS=""
         for arg in $(cat /proc/cmdline); do
@@ -310,7 +383,8 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "llmjail-mounts.service" "network-online.target" ];
       wants = [ "network-online.target" ];
-      before = [ "llmjail-tool.service" ];
+      before = [ "llmjail-ready.target" ];
+      unitConfig.FailureAction = "poweroff-force";
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
@@ -401,35 +475,77 @@ in
       '';
     };
 
-    # Applies host-published terminal sizes to /dev/hvc0 via TIOCSWINSZ. tty
-    # core handles the ioctl (driver-independent), so it delivers SIGWINCH to
-    # hvc0's foreground pgrp just as it did for ttyS0.
-    systemd.services.llmjail-winsize = {
-      description = "Apply terminal size updates from host via virtio-serial";
-      wantedBy = [ "multi-user.target" ];
-      before = [ "llmjail-tool.service" ];
-      after = [ "llmjail-mounts.service" ];
-      serviceConfig = {
-        Type = "simple";
-        # `always`, not `on-failure`: if the host bridge disconnects the
-        # read loop exits 0, and we still want the service back so the
-        # next reconnect delivers resizes.
-        Restart = "always";
-        RestartSec = "1s";
+    # The tool runs in an ssh session over the llmjail.ssh virtserialport.
+    # The NixOS module supplies sshd_config, PAM, the privsep user and the
+    # host key; its own listening sshd.service never starts, so nothing in
+    # the guest listens for sshd on any network or vsock address.
+    services.openssh = {
+      enable = true;
+      openFirewall = false;
+      authorizedKeysInHomedir = false;
+      hostKeys = [ { type = "ed25519"; path = "/etc/ssh/ssh_host_ed25519_key"; } ];
+      settings = {
+        PasswordAuthentication = false;
+        KbdInteractiveAuthentication = false;
+        PermitRootLogin = "no";
+        AllowUsers = [ "user" ];
+        PrintMotd = false;
+        PrintLastLog = false;
+        PermitUserRC = false;
       };
-      script = ''
-        set -eu
-        while [ ! -e /dev/virtio-ports/llmjail.winsize ]; do
-          sleep 0.1
-        done
-        PREV=""
-        while IFS=' ' read -r COLS ROWS; do
-          [ -n "$COLS" ] && [ -n "$ROWS" ] || continue
-          [ "$COLS $ROWS" = "$PREV" ] && continue
-          PREV="$COLS $ROWS"
-          ${pkgs.coreutils}/bin/stty cols "$COLS" rows "$ROWS" < /dev/hvc0 2>/dev/null || true
-        done < /dev/virtio-ports/llmjail.winsize
-      '';
+    };
+    systemd.services.sshd.wantedBy = lib.mkForce [ ];
+
+    # Root-only port; the systemd tag creates the .device unit llmjail-sshd orders after.
+    services.udev.extraRules = ''
+      KERNEL=="vport*", ATTR{name}=="llmjail.ssh", MODE="0600", OWNER="root", TAG+="systemd"
+    '';
+
+    systemd.targets.llmjail-ready = {
+      description = "llmjail guest setup finished";
+      wantedBy = [ "multi-user.target" ];
+      requires = [ "llmjail-mounts.service" "llmjail-net-filter.service" ];
+      after = [ "llmjail-mounts.service" "llmjail-net-filter.service" ];
+    };
+
+    # One sshd -i serving the single connection the runner's ssh master opens.
+    # When it exits (master closed or connection dropped) the guest powers off.
+    systemd.services.llmjail-sshd = {
+      description = "llmjail sshd on the llmjail.ssh virtio port";
+      wantedBy = [ "multi-user.target" ];
+      requires = [ "llmjail-ready.target" ];
+      wants = [ "sshd-keygen.service" "dev-virtio\\x2dports-llmjail.ssh.device" ];
+      after = [ "llmjail-ready.target" "sshd-keygen.service" "dev-virtio\\x2dports-llmjail.ssh.device" ];
+      path = [ config.services.openssh.package ];
+      environment.LD_LIBRARY_PATH = config.system.nssModules.path;
+      # Backstop: if stdio setup on the port fails, ExecStopPost cannot run either.
+      unitConfig.FailureAction = "poweroff";
+      serviceConfig = {
+        ExecStart = "${config.services.openssh.package}/bin/sshd -i -f /etc/ssh/sshd_config";
+        ExecStopPost = "${pkgs.systemd}/bin/systemctl poweroff --no-block";
+        # Same path for both: systemd opens the port once, read-write.
+        StandardInput = "file:/dev/virtio-ports/llmjail.ssh";
+        StandardOutput = "file:/dev/virtio-ports/llmjail.ssh";
+        StandardError = "journal";
+      };
+    };
+
+    # Bounded stop times so a clean poweroff (services stopped, shares synced)
+    # fits in the runner's 15 s wait. user@ bounds the whole user manager,
+    # rootless dockerd included. MinimumUptimeSec defaults to 15 s since
+    # systemd 256; integer 0 to match test-instrumentation.nix (merge needs equal values).
+    systemd.settings.Manager = {
+      DefaultTimeoutStopSec = "5s";
+      MinimumUptimeSec = 0;
+    };
+    systemd.services."user@".serviceConfig.TimeoutStopSec = "5s";
+
+    # Journal to the serial port behind guest.log. mkDefault: nixosTest's
+    # instrumentation sets these too, and the option only merges equal values.
+    services.journald.settings.Journal = {
+      ForwardToConsole = true;
+      MaxLevelConsole = lib.mkDefault "info";
+      TTYPath = lib.mkDefault (if pkgs.stdenv.hostPlatform.isAarch64 then "/dev/ttyAMA0" else "/dev/ttyS1");
     };
 
     # Register the host store's paths in the guest nix db before the
@@ -483,90 +599,10 @@ in
       '';
     };
 
-
-    systemd.services.llmjail-tool =
-      let
-        launcher = pkgs.writeShellScript "launch-tool" ''
-          # Source NixOS's global environment before modifying env vars. Must be sourced before
-          # `set -u` since some variables such as `XDG_STATE_HOME` may not be set.
-          source /etc/set-environment
-
-          set -euo pipefail
-          # Add host packages to PATH if available (NixOS host)
-          if [ -d /host-user-sw/bin ]; then
-            export PATH="$PATH:/host-user-sw/bin"
-          fi
-          if [ -d /host-sw/bin ]; then
-            export PATH="$PATH:/host-sw/bin"
-          fi
-
-          # cd into the workspace before sourcing dev-env: devenv's shellHook
-          # can do its own relative-path checks (e.g. per-language module
-          # checks like `./foo/package.json`) that assume cwd is the project
-          # root, not wherever WorkingDirectory left us (which is a static
-          # "/workspace" that doesn't exist under --same-path).
-          cd "''${WORKSPACE_DIR:-/workspace}"
-
-          if [ -f /llmjail-env/dev-env ]; then
-            # dev-env is `nix print-dev-env` or `devenv direnv-export`
-            # output - a bash script setting PATH, etc. Neither is written
-            # to tolerate nounset/errexit, so relax strict mode just for
-            # the source.
-            set +euo pipefail
-            # shellcheck disable=SC1091
-            source /llmjail-env/dev-env
-            set -euo pipefail
-          fi
-
-          ARGS=()
-          if [ "''${LLMJAIL_DANGEROUS:-0}" = "1" ]; then
-            ARGS+=(${config.llmjail.dangerousFlag})
-          fi
-
-          # Read null-separated tool args preserving argument boundaries
-          if [ -s /llmjail-env/tool-args ]; then
-            while IFS= read -r -d "" arg; do
-              ARGS+=("$arg")
-            done < /llmjail-env/tool-args
-          fi
-
-          # Apply the initial terminal size synchronously BEFORE exec so the
-          # TUI sees a non-zero TIOCGWINSZ on first read. Dynamic resizes
-          # after this are handled by the llmjail-winsize side-channel.
-          if [ -n "''${COLUMNS:-}" ] && [ -n "''${LINES:-}" ]; then
-            ${pkgs.coreutils}/bin/stty cols "$COLUMNS" rows "$LINES" 2>/dev/null || true
-          fi
-
-          exec ${config.llmjail.toolBinary} "''${ARGS[@]}"
-        '';
-      in
-      {
-        description = "llmjail tool runner";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "llmjail-mounts.service" "llmjail-net-filter.service" "network-online.target" ];
-        wants = [ "llmjail-mounts.service" "llmjail-net-filter.service" "network-online.target" ];
-        path = [ "/run/current-system/sw" ];
-        serviceConfig = {
-          User = "user";
-          WorkingDirectory = "-/workspace";
-          EnvironmentFile = "/llmjail-env/env";
-          StandardInput = "tty";
-          StandardOutput = "tty";
-          StandardError = "tty";
-          TTYPath = "/dev/hvc0";
-          TTYReset = true;
-          TTYVHangup = false;
-          ExecStart = "${launcher}";
-          ExecStopPost = "+${pkgs.systemd}/bin/systemctl poweroff --force --force";
-        };
-      };
-
     systemd.services."serial-getty@ttyAMA0".enable = false;
     systemd.services."serial-getty@ttyS0".enable = false;
     systemd.services."serial-getty@ttyS1".enable = false;
-    systemd.services."serial-getty@hvc0".enable = false;
     systemd.services."getty@tty1".enable = false;
-    systemd.services."getty@hvc0".enable = false;
 
     documentation.enable = false;
     nix.settings.experimental-features = [ "nix-command" "flakes" ];
