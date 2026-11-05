@@ -7,28 +7,61 @@ on:
   workflow_call:
   workflow_dispatch:
 
+concurrency:
+  group: build-ci
+  cancel-in-progress: true
+
 jobs:
-  smoke-tests:
+  build-and-cache:
     runs-on: ubuntu-latest
     steps:
-      - uses: jlumbroso/free-disk-space@36e9a5af4eddb91fc11aec4c6f6f79b3cc0cb523
-        with:
-          tool-cache: true
-
       - uses: actions/checkout@v7
-
       - uses: cachix/install-nix-action@v31
-
-      - uses: nix-community/cache-nix-action@v7
-        with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-
-          gc-max-store-size-linux: 1G
 
       # Ubuntu's AppArmor strips capabilities from unprivileged user
       # namespaces, which virtiofsd --sandbox=namespace needs
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
-      - name: Run smoke tests
-        run: nix flake check --print-build-logs
+      - name: Configure attic
+        env:
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: |
+          nix profile add --impure --expr \
+            "(builtins.getFlake (toString ./.)).inputs.nixpkgs.legacyPackages.$(uname -m)-linux.attic-client"
+          attic login main https://cache.langsjo.dev "$ATTIC_TOKEN"
+          attic use main
+
+      # Must run before the checks: anything they build locally would no longer
+      # show up in the dry-run, and so would never be pushed to the cache
+      - name: List uncached derivations
+        run: |
+          nix eval .#packages.x86_64-linux --apply builtins.attrNames --json \
+            | jq -r '.[] | ".#packages.x86_64-linux.\(.).virtiofs"' > /tmp/packages.txt
+          mapfile -t packages < /tmp/packages.txt
+
+          if ! nix_build_output=$(nix build "${packages[@]}" --dry-run 2>&1 >/dev/null); then
+            printf "%s" "$nix_build_output"
+            exit 1
+          fi
+
+          # Skip preferLocalBuild derivations, consumers build those themselves anyway
+          if awk '
+                /these [0-9]+ paths will be fetched/{exit}
+                /these [0-9]+ derivations will be built/{next}
+                {print}
+            ' <<< "$nix_build_output" \
+            | grep '\.drv$' \
+            | xargs grep -vlE '\\"preferLocalBuild\\":true|\("preferLocalBuild","1"\)' > /tmp/build_drvs.txt
+          then
+            xargs nix-store --realise < /tmp/build_drvs.txt
+          else
+            echo "Seemingly no derivations to be built; output from dry-run:"
+            printf "%s\n" "$nix_build_output"
+          fi
+
+      - name: Push to cache
+        run: |
+          if [ -s /tmp/build_drvs.txt ]; then
+            xargs nix-store --query --outputs < /tmp/build_drvs.txt | attic push main --stdin
+          fi
