@@ -1,13 +1,13 @@
-{ pkgs, codex-cli, ... }:
+{ pkgs, codex, ... }:
 
 {
   imports = [ ./common.nix ];
 
-  llmjail.toolBinary = "${codex-cli}/bin/codex";
+  llmjail.toolBinary = "${codex}/bin/codex";
   llmjail.dangerousFlag = "--dangerously-bypass-approvals-and-sandbox";
 
   environment.systemPackages = [
-    codex-cli
+    codex
     pkgs.bubblewrap
   ];
 

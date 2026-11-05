@@ -1,4 +1,4 @@
-{ pkgs, pi-coding-agent, ... }:
+{ pkgs, pi, ... }:
 
 {
   imports = [ ./common.nix ];
@@ -15,11 +15,11 @@
       echo '{"defaultProjectTrust":"trusted"}' > "$SETTINGS"
     fi
 
-    exec ${pkgs.lib.getExe pi-coding-agent} "$@"
+    exec ${pkgs.lib.getExe pi} "$@"
   '';
   llmjail.dangerousFlag = "";
 
   environment.systemPackages = [
-    pi-coding-agent
+    pi
   ];
 }

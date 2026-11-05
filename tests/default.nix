@@ -1,4 +1,4 @@
-{ pkgs, nixpkgs, nixpkgs-rolling, claude-code, codex-cli, copilot-cli, opencode, omp, autolith ? null, pi-coding-agent ? null, shell }:
+{ pkgs, nixpkgs, nixpkgs-rolling, claude-code, codex, copilot-cli, opencode, omp, autolith ? null, pi ? null, shell }:
 
 let
   mkSmokeTest = { name, guestModule, toolBinary }:
@@ -7,7 +7,7 @@ let
 
       nodes.machine = { lib, ... }: {
         imports = [ guestModule ];
-        _module.args = { inherit nixpkgs nixpkgs-rolling claude-code codex-cli copilot-cli opencode omp autolith pi-coding-agent; };
+        _module.args = { inherit nixpkgs nixpkgs-rolling claude-code codex copilot-cli opencode omp autolith pi; };
         # Override 9p filesystem entries from common.nix - the test framework
         # provides its own root and /nix/store via virtualisation options.
         fileSystems."/.nix-lower/store" = lib.mkForce {
@@ -106,7 +106,7 @@ let
 
     nodes.machine = { lib, ... }: {
       imports = [ ../guests/claude.nix ];
-      _module.args = { inherit nixpkgs nixpkgs-rolling claude-code codex-cli; };
+      _module.args = { inherit nixpkgs nixpkgs-rolling claude-code codex; };
 
       fileSystems."/.nix-lower/store" = lib.mkForce {
         device = "tmpfs";
@@ -281,7 +281,7 @@ in
   codex-smoke = mkSmokeTest {
     name = "codex";
     guestModule = ../guests/codex.nix;
-    toolBinary = "${codex-cli}/bin/codex";
+    toolBinary = "${codex}/bin/codex";
   };
 
   copilot-smoke = mkSmokeTest {
@@ -299,7 +299,7 @@ in
   pi-smoke = mkSmokeTest {
     name = "pi";
     guestModule = ../guests/pi.nix;
-    toolBinary = pkgs.lib.getExe pi-coding-agent;
+    toolBinary = pkgs.lib.getExe pi;
   };
 
   omp-smoke = mkSmokeTest {

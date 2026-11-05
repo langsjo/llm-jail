@@ -6,13 +6,10 @@
 
     # Nixpkgs that is pinned in NIX_PATH and flake registry in the VM, should be up to date
     nixpkgs-rolling.url = "github:NixOS/nixpkgs/nixos-unstable";
-    claude-code-nix.url = "github:sadjow/claude-code-nix";
-    codex-cli-nix.url = "github:sadjow/codex-cli-nix";
     llm-agents.url = "github:numtide/llm-agents.nix";
-    autolith.url = "github:luciusmagn/autolith";
   };
 
-  outputs = { self, nixpkgs, nixpkgs-rolling, claude-code-nix, codex-cli-nix, llm-agents, autolith, ... }:
+  outputs = { self, nixpkgs, nixpkgs-rolling, llm-agents, ... }:
     let
       supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
       tools = import ./tools.nix;
@@ -38,22 +35,24 @@
           # on the resulting runner derivation. Consumers can swap any of these
           # without forking the flake.
           defaultArgs = {
-            claude-code = claude-code-nix.packages.${system}.default;
-            codex-cli = codex-cli-nix.packages.${system}.default;
-            copilot-cli = llm-agents.packages.${system}.copilot-cli;
-            opencode = llm-agents.packages.${system}.opencode;
-            autolith = autolith.packages.${system}.default;
-            pi-coding-agent = llm-agents.packages.${system}.pi;
-            omp = nixpkgs-rolling.legacyPackages.${system}.omp;
+            inherit (llm-agents.packages.${system})
+              claude-code
+              codex
+              copilot-cli
+              opencode
+              autolith
+              pi
+              omp
+              ;
           };
           tool = pkgs.lib.makeOverridable (
           {
             claude-code,
-            codex-cli,
+            codex,
             copilot-cli,
             opencode,
             autolith,
-            pi-coding-agent,
+            pi,
             omp,
             flags ? { },
           }:
@@ -65,11 +64,11 @@
                   nixpkgs
                   nixpkgs-rolling
                   claude-code
-                  codex-cli
+                  codex
                   copilot-cli
                   opencode
                   autolith
-                  pi-coding-agent
+                  pi
                   omp
                   ;
               };
@@ -104,18 +103,20 @@
       checks = forAllSystems (system:
         import ./tests {
           inherit nixpkgs nixpkgs-rolling;
+          inherit (llm-agents.packages.${system})
+            claude-code
+            codex
+            copilot-cli
+            opencode
+            autolith
+            pi
+            omp
+            ;
+          inherit (self.packages.${system}) shell;
           pkgs = import nixpkgs {
             inherit system;
             config.allowUnfree = true;
           };
-          claude-code = claude-code-nix.packages.${system}.default;
-          codex-cli = codex-cli-nix.packages.${system}.default;
-          copilot-cli = llm-agents.packages.${system}.copilot-cli;
-          opencode = llm-agents.packages.${system}.opencode;
-          autolith = autolith.packages.${system}.default;
-          pi-coding-agent = llm-agents.packages.${system}.pi;
-          omp = nixpkgs-rolling.legacyPackages.${system}.omp;
-          inherit (self.packages.${system}) shell;
         }
       );
     };

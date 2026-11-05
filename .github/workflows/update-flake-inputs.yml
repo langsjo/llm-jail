@@ -44,7 +44,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -B "$BRANCH"
 
-          inputs=(nixpkgs-rolling claude-code-nix codex-cli-nix llm-agents autolith)
+          inputs=(nixpkgs-rolling llm-agents)
           # The guest's base nixpkgs only moves weekly, on Sundays
           if [ "$(date -u +%u)" = 7 ]; then
             inputs+=(nixpkgs)
