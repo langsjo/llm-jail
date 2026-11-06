@@ -143,6 +143,16 @@ let
       ''}
     '';
 
+  # Records what the rc and the command line resolved to.
+  rcProbe = pkgs.writeShellScript "llmjail-probe-rc" ''
+    nproc > vcpus
+    tr '\0' '|' < /llmjail-env/tool-args > tool-args
+    cp /llmjail-env/allowed-domains domains
+    # Created only if parsing the rc ran its $(...) on the host
+    ls pwned >injected 2>&1
+    exit 0
+  '';
+
   # Runs the tmpfs-root shell runner in the background with a custom probe.
   backgroundRunner = probe: ''
     ${prelude { inherit probe; }}
@@ -213,10 +223,7 @@ in
   runner-rc-merge = mkRunnerTest {
     name = "rc-merge";
     runner = shell;
-    probe = pkgs.writeShellScript "llmjail-probe-rc" ''
-      nproc > vcpus
-      tr '\0' '|' < /llmjail-env/tool-args > tool-args
-    '';
+    probe = rcProbe;
     setup = writeRc { content = "--vcpu 1 \\\n  -- rc-arg \"two words\""; };
     runnerArgs = [
       "--vcpu"
@@ -228,6 +235,71 @@ in
       "vcpus:^2$"
       "tool-args:^rc-arg\\|two words\\|cli-arg\\|$"
     ];
+  };
+
+  # The `--` is only in the rc, so the command line's flag is still a runner flag.
+  runner-rc-syntax = mkRunnerTest {
+    name = "rc-syntax";
+    runner = shell;
+    probe = rcProbe;
+    setup = writeRc {
+      content = ''
+        --allow-domain rc.example
+        -- 'single quoted' back\ slash "" $HOME $(touch pwned)
+        next-line'';
+    };
+    runnerArgs = [
+      "--allow-domain"
+      "cli.example"
+    ];
+    expect = [
+      "tool-args:^single quoted\\|back slash\\|\\|\\$HOME\\|\\$\\(touch\\|pwned\\)\\|next-line\\|$"
+      "domains:^rc\\.example$"
+      "domains:^cli\\.example$"
+      "injected:No such file"
+    ];
+  };
+
+  # The `--` is only on the command line, so the rc's flag still applies.
+  runner-rc-cli-dashes = mkRunnerTest {
+    name = "rc-cli-dashes";
+    runner = shell;
+    probe = rcProbe;
+    setup = writeRc { content = "--vcpu 1"; };
+    runnerArgs = [
+      "--"
+      "cli-arg"
+    ];
+    expect = [
+      "vcpus:^1$"
+      "tool-args:^cli-arg\\|$"
+    ];
+  };
+
+  runner-rc-empty = mkRunnerTest {
+    name = "rc-empty";
+    runner = shell;
+    probe = rcProbe;
+    setup = writeRc { content = ""; };
+    runnerArgs = [
+      "--"
+      "cli-arg"
+    ];
+    expect = [ "tool-args:^cli-arg\\|$" ];
+  };
+
+  # The rc's last flag must not take the command line's first argument as its value.
+  runner-rc-missing-value = mkRunnerTest {
+    name = "rc-missing-value";
+    runner = shell;
+    setup = writeRc { content = "--vcpu"; };
+    runnerArgs = [
+      "--mem"
+      "2000"
+    ];
+    expectExit = 1;
+    expect = [ "runner.log:unbound variable" ];
+    reject = [ "runner.log:Booting VM" ];
   };
 
   runner-rc-unapproved = mkRunnerTest {
