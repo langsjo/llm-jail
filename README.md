@@ -104,6 +104,23 @@ llm-jail-{claude,codex,copilot,opencode,autolith,pi,shell} [options] [-- tool-ar
 
 Press **Enter**, **~**, **.** to end the session; the VM shuts down.
 
+### `.llmjailrc`
+
+If the working directory has a `.llmjailrc`, its contents are treated as arguments placed before the command line's, so the command line wins:
+
+```
+--mem 2000 --mask secrets -- --model opus
+```
+
+With that file, `llm-jail-claude --mem 4000 -- -p "hi"` uses 4000 MB and passes `--model opus -p "hi"` to the tool. A `--` in the file or on the command line only ends the runner flags of that source. Repeatable flags like `--mount` accumulate, and a flag without a value like `--dangerous` can't be turned off from the command line.
+
+Arguments are split on whitespace and newlines, honoring `'...'`, `"..."` and `\`. Nothing is expanded (`$HOME` and `~` stay literal) and there are no comments.
+
+The agent can write to the workspace and a cloned repo can ship this file, and its flags can widen the jail, so the runner asks before using a new or changed file. Declining aborts the run, as does an unapproved file when stdin is not a terminal. Approvals live in `~/.config/llm-jail/approved-rc`, one `<sha256 of contents>  <directory>` per line; delete a line to revoke it. Don't mount that file read-write into a jail: the agent could approve its own rc.
+
+> [!WARNING]
+> Read what you approve. The approval only proves you saw this content once, and an agent can also change the file through git (a commit you later check out), which is why a changed file prompts again.
+
 ### Inspecting a running jail
 
 At startup the runner prints an `ssh -F <rundir>/ssh_config jail`

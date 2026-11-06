@@ -129,6 +129,20 @@ let
     "runner.log:lost connection to VM"
   ];
 
+  # Writes .llmjailrc and, unless approve is false, the matching approval.
+  writeRc =
+    {
+      content,
+      approve ? true,
+    }:
+    ''
+      printf '%s\n' ${lib.escapeShellArg content} > .llmjailrc
+      ${lib.optionalString approve ''
+        mkdir -p "$HOME/.config/llm-jail"
+        echo "$(sha256sum < .llmjailrc | cut -d' ' -f1)  $PWD" >> "$HOME/.config/llm-jail/approved-rc"
+      ''}
+    '';
+
   # Runs the tmpfs-root shell runner in the background with a custom probe.
   backgroundRunner = probe: ''
     ${prelude { inherit probe; }}
@@ -194,6 +208,96 @@ in
     extraEnv.ANTHROPIC_API_KEY = "$(touch /workspace/pwned)";
     expect = [ "injected:No such file" ];
   };
+
+  # The rc's `--` must not turn the command line's runner flags into tool args.
+  runner-rc-merge = mkRunnerTest {
+    name = "rc-merge";
+    runner = shell;
+    probe = pkgs.writeShellScript "llmjail-probe-rc" ''
+      nproc > vcpus
+      tr '\0' '|' < /llmjail-env/tool-args > tool-args
+    '';
+    setup = writeRc { content = "--vcpu 1 \\\n  -- rc-arg \"two words\""; };
+    runnerArgs = [
+      "--vcpu"
+      "2"
+      "--"
+      "cli-arg"
+    ];
+    expect = [
+      "vcpus:^2$"
+      "tool-args:^rc-arg\\|two words\\|cli-arg\\|$"
+    ];
+  };
+
+  runner-rc-unapproved = mkRunnerTest {
+    name = "rc-unapproved";
+    runner = shell;
+    setup = writeRc {
+      content = "--vcpu 1";
+      approve = false;
+    };
+    expectExit = 1;
+    expect = [ "runner.log:new or changed" ];
+    reject = [ "runner.log:Booting VM" ];
+  };
+
+  runner-rc-changed = mkRunnerTest {
+    name = "rc-changed";
+    runner = shell;
+    setup = ''
+      ${writeRc { content = "--vcpu 1"; }}
+      echo "--no-net-filter" > .llmjailrc
+    '';
+    expectExit = 1;
+    expect = [ "runner.log:new or changed" ];
+    reject = [ "runner.log:Booting VM" ];
+  };
+
+  runner-rc-unbalanced-quote = mkRunnerTest {
+    name = "rc-unbalanced-quote";
+    runner = shell;
+    setup = writeRc { content = ''-- "oops''; };
+    expectExit = 1;
+    expect = [ "runner.log:could not parse" ];
+    reject = [ "runner.log:Booting VM" ];
+  };
+
+  # Answers the prompt on a pty. The rc's --tmpdir makes the runner fail right
+  # after applying it, so no VM boots: that error proves the rc was applied.
+  runner-rc-prompt =
+    pkgs.runCommand "llmjail-runner-rc-prompt"
+      {
+        nativeBuildInputs = [ pkgs.util-linux ];
+      }
+      ''
+        ${prelude { probe = defaultProbe; }}
+        ${writeRc {
+          content = "--tmpdir /nonexistent";
+          approve = false;
+        }}
+        approvals=$HOME/.config/llm-jail/approved-rc
+        answer() {
+          # script runs its command through $SHELL, which the prelude set to the probe
+          printf '%s\n' "$1" | SHELL=${pkgs.runtimeShell} script -qec ${shell}/bin/llm-jail-shell /dev/null >"$TMPDIR/runner.log" 2>&1 || true
+        }
+
+        answer n
+        grep -q "not approved" "$TMPDIR/runner.log" || fail "declining did not abort"
+        [ ! -e "$approvals" ] || fail "declining stored an approval"
+
+        answer y
+        grep -q "tmpdir '/nonexistent' does not exist" "$TMPDIR/runner.log" || fail "approved rc was not applied"
+        [ "$(wc -l < "$approvals")" = 1 ] || fail "approval was not stored once"
+
+        # stdin is no terminal now, so this only passes if the approval was remembered
+        rc=0
+        ${shell}/bin/llm-jail-shell </dev/null >"$TMPDIR/runner.log" 2>&1 || rc=$?
+        [ "$rc" = 1 ] || fail "runner exited with $rc, expected 1"
+        grep -q "tmpdir '/nonexistent' does not exist" "$TMPDIR/runner.log" || fail "approval was not remembered"
+
+        touch $out
+      '';
 
   # The workspace path ends up in ssh_config, where ssh expands % tokens.
   runner-reject-percent = mkRunnerTest {

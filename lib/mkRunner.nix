@@ -19,6 +19,8 @@ pkgs.writeShellApplication {
   runtimeInputs = [
     qemuPkg
     pkgs.coreutils
+    pkgs.findutils
+    pkgs.gnugrep
     pkgs.util-linux
     pkgs.nix
     pkgs.e2fsprogs
@@ -60,6 +62,9 @@ pkgs.writeShellApplication {
     usage() {
       cat <<'USAGE'
     Usage: llm-jail-${name} [options] [-- tool-args...]
+
+    Arguments in ./.llmjailrc, once approved, are applied before these, so the
+    command line wins. Approvals are kept in ~/.config/llm-jail/approved-rc.
 
     Options:
       --dangerous           Enable the tool's dangerous / unattended mode
@@ -111,37 +116,76 @@ pkgs.writeShellApplication {
     }
     trap cleanup EXIT
 
-    while [ $# -gt 0 ]; do
-      case "$1" in
-        --dangerous)   DANGEROUS=1; shift ;;
-        --nix-env)     NIX_ENV=1; shift ;;
-        --devenv)      DEVENV=1; shift ;;
-        --dev-env|--dev-env=*)
-                       echo "ERROR: --dev-env has been renamed to --nix-env." >&2
-                       exit 1 ;;
-        --profile)     PROFILE="$2"; shift 2 ;;
-        --state-dir)   STATE_DIR="$2"; shift 2 ;;
-        --config-dir|--config-dir=*)
-                       echo "ERROR: --config-dir has been renamed to --state-dir and will be mounted as read-write." >&2
-                       exit 1 ;;
-        --mount)       EXTRA_MOUNTS+=("$2:rw"); shift 2 ;;
-        --ro-mount)    EXTRA_MOUNTS+=("$2:ro"); shift 2 ;;
-        --tmpdir)      LLMJAIL_TMPDIR="$2"; shift 2 ;;
-        --immutable)    IMMUTABLE=1; shift ;;
-        --same-path)   SAME_PATH=1; shift ;;
-        --allow-domain)  EXTRA_DOMAINS+=("$2"); shift 2 ;;
-        --no-net-filter) NET_FILTER=0; shift ;;
-        --mask)        MASK_PATTERNS+=("$2"); shift 2 ;;
-        --disk)        DISK_SIZE="$2"; shift 2 ;;
-        --store-disk)  echo "WARNING: --store-disk is deprecated; use --disk" >&2
-                       DISK_SIZE="$2"; shift 2 ;;
-        --mem)         MEM="$2"; shift 2 ;;
-        --vcpu)        VCPU="$2"; shift 2 ;;
-        -h|--help)     usage ;;
-        --)            shift; TOOL_ARGS=("$@"); break ;;
-        *)             echo "Unknown option: $1" >&2; usage ;;
-      esac
-    done
+    # Called once per argument source, so a `--` ends only that source's runner
+    # flags: later sources still parse theirs, and tool args accumulate in order.
+    parse_args() {
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --dangerous)   DANGEROUS=1; shift ;;
+          --nix-env)     NIX_ENV=1; shift ;;
+          --devenv)      DEVENV=1; shift ;;
+          --dev-env|--dev-env=*)
+                         echo "ERROR: --dev-env has been renamed to --nix-env." >&2
+                         exit 1 ;;
+          --profile)     PROFILE="$2"; shift 2 ;;
+          --state-dir)   STATE_DIR="$2"; shift 2 ;;
+          --config-dir|--config-dir=*)
+                         echo "ERROR: --config-dir has been renamed to --state-dir and will be mounted as read-write." >&2
+                         exit 1 ;;
+          --mount)       EXTRA_MOUNTS+=("$2:rw"); shift 2 ;;
+          --ro-mount)    EXTRA_MOUNTS+=("$2:ro"); shift 2 ;;
+          --tmpdir)      LLMJAIL_TMPDIR="$2"; shift 2 ;;
+          --immutable)    IMMUTABLE=1; shift ;;
+          --same-path)   SAME_PATH=1; shift ;;
+          --allow-domain)  EXTRA_DOMAINS+=("$2"); shift 2 ;;
+          --no-net-filter) NET_FILTER=0; shift ;;
+          --mask)        MASK_PATTERNS+=("$2"); shift 2 ;;
+          --disk)        DISK_SIZE="$2"; shift 2 ;;
+          --store-disk)  echo "WARNING: --store-disk is deprecated; use --disk" >&2
+                         DISK_SIZE="$2"; shift 2 ;;
+          --mem)         MEM="$2"; shift 2 ;;
+          --vcpu)        VCPU="$2"; shift 2 ;;
+          -h|--help)     usage ;;
+          --)            shift; TOOL_ARGS+=("$@"); break ;;
+          *)             echo "Unknown option: $1" >&2; usage ;;
+        esac
+      done
+    }
+
+    # The agent can write to the workspace and a cloned repo can ship this file,
+    # and its flags can widen the jail, so it needs approval from the user. Hash,
+    # prompt and parsing all use one read of the file, so it
+    # cannot change between approval and use.
+    RC_ARGS=()
+    if [ -f .llmjailrc ]; then
+      RC_CONTENT=$(cat .llmjailrc)
+      RC_APPROVAL="$(sha256sum <<<"$RC_CONTENT" | cut -d' ' -f1)  $PWD"
+      RC_APPROVALS="''${XDG_CONFIG_HOME:-$HOME/.config}/llm-jail/approved-rc"
+      if ! grep -Fxqs -- "$RC_APPROVAL" "$RC_APPROVALS"; then
+        if [ ! -t 0 ]; then
+          echo "ERROR: $PWD/.llmjailrc is new or changed; run from a terminal to approve it" >&2
+          exit 1
+        fi
+        echo "$PWD/.llmjailrc is new or changed. It can widen the jail (--mount, --no-net-filter, ...):" >&2
+        # cat -v: control characters must not be able to hide what is approved
+        cat -v <<<"$RC_CONTENT" >&2
+        read -r -p "Apply it and remember this approval? [y/N] " RC_ANSWER || true
+        # Not "continue without it": the file may hold restrictions like --mask.
+        if [[ "$RC_ANSWER" != [yY] ]]; then
+          echo "ERROR: $PWD/.llmjailrc not approved; remove it to run without it" >&2
+          exit 1
+        fi
+        mkdir -p "$(dirname "$RC_APPROVALS")"
+        echo "$RC_APPROVAL" >> "$RC_APPROVALS"
+      fi
+      # xargs only splits (whitespace, quotes, backslashes); nothing is expanded or run.
+      # It would keep a backslash-escaped newline in the arg, so join those lines first.
+      mapfile -d "" -t RC_ARGS < <(xargs -r printf '%s\0' <<<"''${RC_CONTENT//$'\\\n'/ }")
+      wait $! || { echo "ERROR: could not parse $PWD/.llmjailrc" >&2; exit 1; }
+    fi
+
+    parse_args "''${RC_ARGS[@]}"
+    parse_args "$@"
 
     # Jail-private tool state, fully separate from the host tool's own
     # config dir. --state-dir / LLMJAIL_STATE_DIR overrides the default
