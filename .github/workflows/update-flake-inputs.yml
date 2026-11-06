@@ -2,7 +2,8 @@ name: Update flake inputs
 
 on:
   schedule:
-    - cron: "0 6 * * *" # daily at 06:00 UTC
+    - cron: "41 5 * * *"
+      timezone: Europe/Helsinki
   workflow_dispatch:
 
 concurrency:
