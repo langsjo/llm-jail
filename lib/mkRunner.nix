@@ -265,7 +265,11 @@ pkgs.writeShellApplication {
     }
 
     validate_path "$LLMJAIL_TMPDIR" "tmpdir"
-    RUNDIR=$(mktemp -d --tmpdir="$LLMJAIL_TMPDIR")
+    # Named after the tool and project so it can be found once the printed
+    # inspection command has scrolled away.
+    PROJECT=''${PWD##*/}
+    PROJECT=''${PROJECT:0:8}
+    RUNDIR=$(mktemp -d --tmpdir="$LLMJAIL_TMPDIR" "${name}-''${PROJECT//[^A-Za-z0-9._+-]/_}.XXX")
 
     cleanup_rundir() {
       [ -d "$RUNDIR" ] && rm -rf "$RUNDIR"
