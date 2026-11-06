@@ -100,6 +100,7 @@ llm-jail-{claude,codex,copilot,opencode,autolith,pi,shell} [options] [-- tool-ar
 | `--no-net-filter` | Disable network filtering (unrestricted access) | filtering on |
 | `--mem SIZE` | VM memory in MB | 4096 |
 | `--vcpu COUNT` | Number of vCPUs | 2 |
+| `--norc` | Ignore `.llmjailrc` | off |
 | `-h`, `--help` | Show help | - |
 
 Press **Enter**, **~**, **.** to end the session; the VM shuts down.
@@ -116,7 +117,7 @@ With that file, `llm-jail-claude --mem 4000 -- -p "hi"` uses 4000 MB and passes 
 
 Arguments are split on whitespace and newlines, honoring `'...'`, `"..."` and `\`. Nothing is expanded (`$HOME` and `~` stay literal) and there are no comments.
 
-The agent can write to the workspace and a cloned repo can ship this file, and its flags can widen the jail, so the runner asks before using a new or changed file. Declining aborts the run, as does an unapproved file when stdin is not a terminal. Approvals live in `~/.config/llm-jail/approved-rc`, one `<sha256 of contents>  <directory>` per line; delete a line to revoke it. Don't mount that file read-write into a jail: the agent could approve its own rc.
+The agent can write to the workspace and a cloned repo can ship this file, and its flags can widen the jail, so the runner asks before using a new or changed file. Declining aborts the run, as does an unapproved file when stdin is not a terminal; use `--norc` to run without the file. Approvals live in `~/.config/llm-jail/approved-rc`, one `<sha256 of contents>  <directory>` per line; delete a line to revoke it. Don't mount that file read-write into a jail: the agent could approve its own rc.
 
 > [!WARNING]
 > Read what you approve. The approval only proves you saw this content once, and an agent can also change the file through git (a commit you later check out), which is why a changed file prompts again.

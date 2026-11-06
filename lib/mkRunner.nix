@@ -95,6 +95,7 @@ pkgs.writeShellApplication {
       --no-net-filter       Disable network filtering (unrestricted access)
       --mem SIZE            Memory in MB (default: ${toString toolDefaults.mem})
       --vcpu COUNT          vCPUs (default: ${toString toolDefaults.vcpu})
+      --norc                Ignore ./.llmjailrc
       -h, --help            Show this help
 
     Press Enter ~ . to end the session (the VM shuts down). The runner
@@ -145,6 +146,7 @@ pkgs.writeShellApplication {
                          DISK_SIZE="$2"; shift 2 ;;
           --mem)         MEM="$2"; shift 2 ;;
           --vcpu)        VCPU="$2"; shift 2 ;;
+          --norc)        shift ;; # acted on below, before any parsing
           -h|--help)     usage ;;
           --)            shift; TOOL_ARGS+=("$@"); break ;;
           *)             echo "Unknown option: $1" >&2; usage ;;
@@ -157,13 +159,21 @@ pkgs.writeShellApplication {
     # prompt and parsing all use one read of the file, so it
     # cannot change between approval and use.
     RC_ARGS=()
-    if [ -f .llmjailrc ]; then
+    # shortcut: a flag value spelled "--norc" or "--" is misread here; no real value is.
+    NORC=0
+    for arg in "$@"; do
+      case "$arg" in
+        --) break ;;
+        --norc) NORC=1 ;;
+      esac
+    done
+    if [ "$NORC" = 0 ] && [ -f .llmjailrc ]; then
       RC_CONTENT=$(cat .llmjailrc)
       RC_APPROVAL="$(sha256sum <<<"$RC_CONTENT" | cut -d' ' -f1)  $PWD"
       RC_APPROVALS="''${XDG_CONFIG_HOME:-$HOME/.config}/llm-jail/approved-rc"
       if ! grep -Fxqs -- "$RC_APPROVAL" "$RC_APPROVALS"; then
         if [ ! -t 0 ]; then
-          echo "ERROR: $PWD/.llmjailrc is new or changed; run from a terminal to approve it" >&2
+          echo "ERROR: $PWD/.llmjailrc is new or changed; run from a terminal to approve it, or use --norc" >&2
           exit 1
         fi
         echo "$PWD/.llmjailrc is new or changed. It can widen the jail (--mount, --no-net-filter, ...):" >&2
@@ -172,7 +182,7 @@ pkgs.writeShellApplication {
         read -r -p "Apply it and remember this approval? [y/N] " RC_ANSWER || true
         # Not "continue without it": the file may hold restrictions like --mask.
         if [[ "$RC_ANSWER" != [yY] ]]; then
-          echo "ERROR: $PWD/.llmjailrc not approved; remove it to run without it" >&2
+          echo "ERROR: $PWD/.llmjailrc not approved; use --norc to run without it" >&2
           exit 1
         fi
         mkdir -p "$(dirname "$RC_APPROVALS")"

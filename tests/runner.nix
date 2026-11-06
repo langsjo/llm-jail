@@ -335,6 +335,44 @@ in
     reject = [ "runner.log:Booting VM" ];
   };
 
+  # --norc needs no approval, since the file is not used at all.
+  runner-rc-norc = mkRunnerTest {
+    name = "rc-norc";
+    runner = shell;
+    probe = rcProbe;
+    setup = writeRc {
+      content = "--vcpu 1 -- rc-arg";
+      approve = false;
+    };
+    runnerArgs = [
+      "--norc"
+      "--vcpu"
+      "2"
+      "--"
+      "cli-arg"
+    ];
+    expect = [
+      "vcpus:^2$"
+      "tool-args:^cli-arg\\|$"
+    ];
+  };
+
+  # After `--` it is the tool's argument, so the rc still needs approval.
+  runner-rc-norc-tool-arg = mkRunnerTest {
+    name = "rc-norc-tool-arg";
+    runner = shell;
+    setup = writeRc {
+      content = "--vcpu 1";
+      approve = false;
+    };
+    runnerArgs = [
+      "--"
+      "--norc"
+    ];
+    expectExit = 1;
+    expect = [ "runner.log:new or changed" ];
+  };
+
   # Answers the prompt on a pty. The rc's --tmpdir makes the runner fail right
   # after applying it, so no VM boots: that error proves the rc was applied.
   runner-rc-prompt =
