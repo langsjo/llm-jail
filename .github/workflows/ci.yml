@@ -30,36 +30,18 @@ jobs:
           attic login main https://cache.langsjo.dev "$ATTIC_TOKEN"
           attic use main
 
-      # Must run before the checks: anything they build locally would no longer
-      # show up in the dry-run, and so would never be pushed to the cache
-      - name: List uncached derivations
+      - name: Build uncached derivations
         run: |
           nix eval .#packages.x86_64-linux --apply builtins.attrNames --json \
             | jq -r '.[] | ".#packages.x86_64-linux.\(.).virtiofs"' > /tmp/packages.txt
           mapfile -t packages < /tmp/packages.txt
 
-          if ! nix_build_output=$(nix build "${packages[@]}" --dry-run 2>&1 >/dev/null); then
-            printf "%s" "$nix_build_output"
-            exit 1
-          fi
-
-          # Skip preferLocalBuild derivations, consumers build those themselves anyway
-          if awk '
-                /these [0-9]+ paths will be fetched/{exit}
-                /these [0-9]+ derivations will be built/{next}
-                {print}
-            ' <<< "$nix_build_output" \
-            | grep '\.drv$' \
-            | xargs grep -vlE '\\"preferLocalBuild\\":true|\("preferLocalBuild","1"\)' > /tmp/build_drvs.txt
-          then
-            xargs nix-store --realise < /tmp/build_drvs.txt
-          else
-            echo "Seemingly no derivations to be built; output from dry-run:"
-            printf "%s\n" "$nix_build_output"
-          fi
+          nix run github:langsjo/nix-build-substitutable \
+            -- --skip-prefer-local --skip-shell-applications "${packages[@]}" \
+            -- --print-build-logs > /tmp/out_paths.txt
 
       - name: Push to cache
         run: |
-          if [ -s /tmp/build_drvs.txt ]; then
-            xargs nix-store --query --outputs < /tmp/build_drvs.txt | attic push main --stdin
+          if [ -s /tmp/out_paths.txt ]; then
+            attic push main --stdin < /tmp/out_paths.txt
           fi
