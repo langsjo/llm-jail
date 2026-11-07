@@ -406,6 +406,30 @@ in
         [ "$rc" = 1 ] || fail "runner exited with $rc, expected 1"
         grep -q "tmpdir '/nonexistent' does not exist" "$TMPDIR/runner.log" || fail "approval was not remembered"
 
+        # Approving a changed rc replaces this directory's approval and no other.
+        first_approval=$(cat "$approvals")
+        subdir_approval="$(printf 'a%.0s' {1..64})  $PWD/sub"
+        echo "$subdir_approval" >> "$approvals"
+        ${writeRc {
+          content = "--tmpdir /changed";
+          approve = false;
+        }}
+        answer y
+        grep -q "tmpdir '/changed' does not exist" "$TMPDIR/runner.log" || fail "changed rc was not applied"
+        ! grep -Fxq -- "$first_approval" "$approvals" || fail "old approval was kept"
+        grep -Fxq -- "$subdir_approval" "$approvals" || fail "approval of another directory was dropped"
+        [ "$(wc -l < "$approvals")" = 2 ] || fail "expected the new approval and the other directory's"
+
+        # So going back to the old content has to prompt again.
+        ${writeRc {
+          content = "--tmpdir /nonexistent";
+          approve = false;
+        }}
+        rc=0
+        ${shell}/bin/llm-jail-shell </dev/null >"$TMPDIR/runner.log" 2>&1 || rc=$?
+        [ "$rc" = 1 ] || fail "runner exited with $rc, expected 1"
+        grep -q "new or changed" "$TMPDIR/runner.log" || fail "old rc was still approved"
+
         touch $out
       '';
 

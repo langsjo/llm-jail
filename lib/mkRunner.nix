@@ -186,7 +186,16 @@ pkgs.writeShellApplication {
           exit 1
         fi
         mkdir -p "$(dirname "$RC_APPROVALS")"
-        echo "$RC_APPROVAL" >> "$RC_APPROVALS"
+        touch "$RC_APPROVALS"
+        # One approval per directory, so going back to an older rc prompts again.
+        RC_APPROVALS_NEW=$(mktemp "$RC_APPROVALS.XXXXXX")
+        while IFS= read -r RC_LINE || [ -n "$RC_LINE" ]; do
+          if [ "''${RC_LINE#*  }" != "$PWD" ]; then
+            printf '%s\n' "$RC_LINE"
+          fi
+        done < "$RC_APPROVALS" > "$RC_APPROVALS_NEW"
+        echo "$RC_APPROVAL" >> "$RC_APPROVALS_NEW"
+        mv "$RC_APPROVALS_NEW" "$RC_APPROVALS"
       fi
       # xargs only splits (whitespace, quotes, backslashes); nothing is expanded or run.
       # It would keep a backslash-escaped newline in the arg, so join those lines first.
