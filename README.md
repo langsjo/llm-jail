@@ -88,6 +88,7 @@ llm-jail-{claude,codex,copilot,opencode,autolith,pi,shell} [options] [-- tool-ar
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--dangerous` | Enable the tool's dangerous / unattended mode | off |
+| `--root` | Run the tool (and inspection shells) as root in the VM; see [Root in the jail](#root-in-the-jail) | off |
 | `--profile NAME` | State profile, a subdir of `--state-dir/<tool>` | `default` |
 | `--state-dir PATH` | Jail state root dir, mounted read-write | `~/.config/llm-jail` |
 | `--immutable` | Mount workspace as read-only | off |
@@ -127,8 +128,8 @@ The agent can write to the workspace and a cloned repo can ship this file, and i
 ### Inspecting a running jail
 
 At startup the runner prints an `ssh -F <rundir>/ssh_config jail`
-command. Running it in another terminal opens a shell as `user` in
-the same VM. That shell closes when the tool session ends, and it
+command. Running it in another terminal opens a shell in the same VM, as
+`user` (or root with `--root`). That shell closes when the tool session ends, and it
 runs as the same user as the agent, so treat what it shows as
 something the agent could have changed.
 
@@ -198,10 +199,16 @@ nix run .#claude.docker -- --disk 20 -- -p "Run the integration tests with docke
 ```
 
 The daemon is rootless: it runs as the agent's own unprivileged user, so
-having Docker doesn't give the agent root in the VM, and container traffic
+having Docker doesn't give the agent root in the VM (use `--root` for that), and container traffic
 goes through the same network filter as the agent itself. Docker Hub
 (`docker.io` and its blob CDN hosts) is whitelisted automatically; other
 registries need `--allow-domain` (e.g. `--allow-domain ghcr.io`).
+
+Let the agent be root in the VM (install packages, load modules, run rootful tools):
+
+```bash
+nix run .#claude -- --root --dangerous
+```
 
 Allow access to additional domains (e.g. for package installs or git cloning):
 
@@ -291,6 +298,18 @@ Default allowed domains per tool:
 
 > [!NOTE]
 > Outbound HTTP/HTTPS is restricted to IPs that dnsmasq resolved through a whitelisted domain - every successful lookup adds the addresses to an nftables set, and the filter only forwards packets whose destination is in that set. Connections to hardcoded IPs that bypass DNS are refused. The guest has no IPv6. The filter works on IP addresses, not hostnames: if an allowed domain shares an IP with other sites (common behind CDNs), those sites are reachable too. This is robust against accidental or prompt-injected exfiltration as long as the whitelisted domains themselves aren't bidirectional data channels - see the dangerous-mode warning below.
+
+## Root in the jail
+
+With `--root`, the tool session and inspection shells run as root in the VM. Without it, root has no login key and the tool runs as the unprivileged `user`.
+
+Root can do anything inside the guest, but every boundary of the jail is enforced on the host, so it cannot widen them:
+
+- **Network:** the filter, DNS server and loopback isolation live in the host-side namespace; the guest only sees its network card.
+- **Files:** each shared directory is served by its own `virtiofsd`, running as you in a user namespace. Read-only shares and read-only git files are refused by the server, masked paths are hidden from it, and guest uids are squashed to yours, so root in the guest can do exactly what your user can do in the writable shares and nothing more.
+- **VM lifetime:** the runner kills QEMU if the guest does not power off within 15 s of the session ending.
+
+What root does change is how directly the agent can reach the virtual machine monitor: root can drive virtual devices itself, so a bug in QEMU or virtiofsd is easier to hit, and such an escape is code execution as your user on the host.
 
 ## Dangerous mode
 

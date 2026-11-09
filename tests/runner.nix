@@ -116,6 +116,7 @@ let
       if eval "$2" >/dev/null 2>&1; then echo "$1: BYPASSED"; else echo "$1: held"; fi
     }
     {
+      id -u > /workspace/uid
       roots=(/workspace)
       if [ "$(id -u)" = 0 ]; then
         for p in .env sub/.env secrets .git/config .git/hooks; do
@@ -535,7 +536,8 @@ in
     '';
   };
 
-  # --mask and the protected git files, as seen from the guest. The logic
+  # --mask and the protected git files, as seen from the guest, as user and as
+  # root. The logic
   # itself is tested without a VM in tests/share.nix.
   runner-protect = mkVmTest {
     name = "protect";
@@ -568,10 +570,15 @@ in
 
       with subtest("masks and git files hold"):
           check_protected("", 10)
+
+      with subtest("masks and git files hold against root, also through a second mount"):
+          check_protected("--root", 20)
+          assert ws("uid").strip() == "0", "the session did not run as root"
     '';
   };
 
-  # The network policy, enforced on the host, filtered and not. `internet` stands in for everything outside the host.
+  # The network policy, enforced on the host: as user and as root, filtered and
+  # not. `internet` stands in for everything outside the host.
   runner-network = mkVmTest {
     name = "network";
     nodes.internet = internetNode;
@@ -639,11 +646,17 @@ in
             "udp": "closed",
         } | closed_always
 
-        with subtest("filtered"):
+        with subtest("filtered, as user"):
             assert_results(checks("--allow-domain allowed.test"), filtered)
 
-        with subtest("unfiltered: everything but the host and link-local"):
-            assert_results(checks("--no-net-filter"), {
+        with subtest("filtered, as root that rewrites its network setup"):
+            assert_results(checks("--root --allow-domain allowed.test"), filtered | {
+                "root-dns-via-own-resolver": "closed",
+                "root-http-from-other-address": "closed",
+            })
+
+        with subtest("unfiltered, as root: everything but the host and link-local"):
+            assert_results(checks("--root --no-net-filter"), {
                 "allowed-http": "open",
                 "evil-dns": "open",
                 "evil-http": "open",
@@ -696,7 +709,7 @@ in
           host.fail("pgrep -u alice -a 'qemu-system|pasta|dnsmasq|virtiofsd|socat'")
 
       with subtest("the inspection shell runs as the session's user and ends with it"):
-          for args, user in [("", "user")]:
+          for args, user in [("", "user"), ("--root", "root")]:
               as_alice(f"""
                 set -eu
                 fail() {{ echo "FAIL: $1"; cat ~/runner.log; exit 1; }}

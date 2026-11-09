@@ -49,17 +49,23 @@ let
             machine.succeed("systemctl is-active llmjail-mounts.service")
             machine.succeed("systemctl is-active llmjail-ready.target")
 
-        with subtest("sshd allows only key login as user"):
+        with subtest("sshd allows only key login, as user or root"):
             # lower(): newer OpenSSH prints the keywords in CamelCase
             output = machine.succeed("sshd -T -f /etc/ssh/sshd_config").lower()
-            for line in ["passwordauthentication no", "permitrootlogin no", "allowusers user", "permituserrc no"]:
-                assert line in output.splitlines(), f"Expected '{line}' in sshd -T output: {output}"
+            lines = output.splitlines()
+            for line in ["passwordauthentication no", "allowusers user", "allowusers root", "permituserrc no"]:
+                assert line in lines, f"Expected '{line}' in sshd -T output: {output}"
+            # sshd -T prints prohibit-password under its old name
+            assert "permitrootlogin without-password" in lines or "permitrootlogin prohibit-password" in lines, \
+                f"root must be limited to key login: {output}"
             keyfile = [l for l in output.splitlines() if l.startswith("authorizedkeysfile")]
             assert keyfile and ".ssh/authorized_keys" not in keyfile[0], f"Unexpected authorizedkeysfile: {keyfile}"
 
-        with subtest("authorized key is installed root-owned and read-only"):
+        with subtest("authorized key is installed root-owned and read-only, for user only"):
             output = machine.succeed("stat -c '%a %U' /etc/ssh/authorized_keys.d/user")
             assert output.strip() == "444 root", f"Unexpected mode/owner: {output}"
+            # Without llmjail.root=1 root has no key, so it cannot log in.
+            machine.fail("test -e /etc/ssh/authorized_keys.d/root")
 
         with subtest("network is static, with the host namespace as gateway and DNS"):
             output = machine.succeed("ip -4 addr show eth0")
@@ -161,7 +167,11 @@ let
           machine.succeed("pgrep -u 1234 -x dockerd")
           machine.fail("pgrep -u root -x dockerd")
           output = machine.succeed("su - user -c 'echo $DOCKER_HOST'")
-          assert output.strip() == "unix:///run/user/1234/docker.sock", f"Unexpected DOCKER_HOST: {output}"
+          assert output.strip() == "unix:///run/llmjail-docker.sock", f"Unexpected DOCKER_HOST: {output}"
+
+      with subtest("root reaches the rootless daemon too (--root sessions)"):
+          output = machine.succeed("bash -lc 'docker info --format {{.SecurityOptions}}'")
+          assert "rootless" in output, f"Expected rootless daemon: {output}"
 
       with subtest("user can run a container"):
           machine.succeed("su - user -c 'docker load < ${dockerTestImage}'")
