@@ -33,7 +33,7 @@ jobs:
       - name: Build uncached derivations
         run: |
           nix eval .#packages.x86_64-linux --apply builtins.attrNames --json \
-            | jq -r '.[] | ".#packages.x86_64-linux.\(.).virtiofs"' > /tmp/packages.txt
+            | jq -r '.[] | ".#packages.x86_64-linux.\(.)"' > /tmp/packages.txt
           mapfile -t packages < /tmp/packages.txt
 
           nix run github:langsjo/nix-build-substitutable \
