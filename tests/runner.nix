@@ -185,6 +185,17 @@ let
       exit 0
     '';
 
+  # As root, kills sshd so the runner reports a lost connection and prints the
+  # logs. The guest's console output in guest.log already carries escape
+  # sequences (systemd's colours, terminal queries at shutdown), so none need
+  # planting; a line logged here would also scroll out of the printed tail
+  # during shutdown. pkill rather than `systemctl kill`: PAM moves the
+  # session's sshd processes out of the service's cgroup.
+  lostConnectionProbe = pkgs.writeShellScript "llmjail-probe-lost-connection" ''
+    ${pkgs.procps}/bin/pkill -KILL sshd
+    sleep 60
+  '';
+
   # Records what the rc and the command line resolved to.
   rcProbe = pkgs.writeShellScript "llmjail-probe-rc" ''
     nproc > vcpus
@@ -704,6 +715,14 @@ in
               if grep -q "$msg" ~/runner.log; then fail "runner printed '$msg'"; fi
             done
           """)
+
+      with subtest("guest-written logs reach the terminal escaped"):
+          log = jail("${lostConnectionProbe}", args="--root", expect_exit=255)
+          expect(log, "lost connection to VM", "runner output")
+          expect(log, r"--- guest\.log \(last 200 lines\) ---", "runner output")
+          # The guest's escape sequences are there, but only as visible text.
+          assert "^[[" in log, "expected escaped escape sequences from the guest's console"
+          assert "\x1b" not in log, "an escape sequence reached the terminal raw"
 
       with subtest("no helper process outlives the run"):
           host.fail("pgrep -u alice -a 'qemu-system|pasta|dnsmasq|virtiofsd|socat'")

@@ -265,25 +265,24 @@ pkgs.writeShellApplication {
       SHELL=${pkgs.runtimeShell} ${pkgs.openssh}/bin/ssh -F "$RUNDIR/ssh_config" "$@"
     }
 
-    # Printed only when the VM fails to boot or the connection is lost.
+    # Printed only when the VM fails to boot or the connection is lost. The
+    # guest controls much of this text (its console and journal, the names it
+    # looks up), so cat -v keeps it from sending escape sequences to the
+    # terminal.
     print_guest_logs() {
       local log
       for log in "$RUNDIR/qemu.log" "$RUNDIR"/virtiofsd-*.log; do
         if [ -s "$log" ]; then
           echo "--- ''${log##*/} ---" >&2
-          cat "$log" >&2
+          cat -v "$log" >&2
         fi
       done
-      # The guest picks the names it looks up; cat -v keeps escape sequences
-      # in them from reaching the terminal.
-      if [ -f "$RUNDIR/dnsmasq.log" ]; then
-        echo "--- dnsmasq.log (last 200 lines) ---" >&2
-        tail -n 200 "$RUNDIR/dnsmasq.log" | cat -v >&2
-      fi
-      if [ -f "$RUNDIR/guest.log" ]; then
-        echo "--- guest.log (last 200 lines) ---" >&2
-        tail -n 200 "$RUNDIR/guest.log" >&2
-      fi
+      for log in dnsmasq.log guest.log; do
+        if [ -f "$RUNDIR/$log" ]; then
+          echo "--- $log (last 200 lines) ---" >&2
+          tail -n 200 "$RUNDIR/$log" | cat -v >&2
+        fi
+      done
     }
 
     validate_path "$LLMJAIL_TMPDIR" "tmpdir"
@@ -636,6 +635,8 @@ pkgs.writeShellApplication {
     # line), so any other client joins the master or fails at once instead of
     # opening a second connection that nothing would answer. Host-key checking
     # is off: the key changes every boot and the transport is private to us.
+    # The guest controls the server end, so the client offers it nothing beyond
+    # the session: no agent, X11 or port forwarding, no local commands.
     LOGIN_USER=user
     if [ "$ROOT" = 1 ]; then
       LOGIN_USER=root
@@ -643,6 +644,10 @@ pkgs.writeShellApplication {
     cat > "$RUNDIR/ssh_config" <<SSHCONFIG
     Host jail
       User $LOGIN_USER
+      ForwardAgent no
+      ForwardX11 no
+      ClearAllForwardings yes
+      PermitLocalCommand no
       ProxyCommand false
       ControlPath $RUNDIR/ctl.sock
       IdentityFile $RUNDIR/id
@@ -762,6 +767,11 @@ pkgs.writeShellApplication {
     # QEMU runs in a network namespace whose only way out is the jail's
     # filter (lib/net.nix).
     #
+    # Hardening, since the guest (root, with --root) can drive every device:
+    # -nodefaults leaves only the devices listed here (no VGA, IDE, floppy,
+    # parallel port), -no-user-config ignores host QEMU config files, and
+    # -sandbox denies syscalls QEMU never needs once it runs.
+    #
     # It runs in its own session so a Ctrl-C to the terminal's process group
     # does not reach it (QEMU installs its own SIGINT handler, overriding the
     # ignore bash gives background jobs). Bash runs without job control, so the
@@ -770,6 +780,9 @@ pkgs.writeShellApplication {
     # pasta (parent-death signal).
     setpriv --pdeathsig KILL -- setsid -- ${net}/bin/llmjail-net "''${NET_ARGS[@]}" -- \
       qemu-system-${arch} \
+      -nodefaults \
+      -no-user-config \
+      -sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny \
       ${lib.optionalString pkgs.stdenv.hostPlatform.isAarch64 "-machine virt,gic-version=max"} \
       "''${KVM_ARGS[@]}" \
       -m "$MEM" \
@@ -821,7 +834,7 @@ pkgs.writeShellApplication {
       echo "VM did not become ready" >&2
       if [ -s "$RUNDIR/ssh-master.log" ]; then
         echo "--- ssh-master.log ---" >&2
-        cat "$RUNDIR/ssh-master.log" >&2
+        cat -v "$RUNDIR/ssh-master.log" >&2
       fi
       print_guest_logs
       exit 1
