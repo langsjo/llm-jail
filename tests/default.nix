@@ -315,6 +315,7 @@ in
   fail-fast-smoke = failFastTest;
 }
 // import ./runner.nix { inherit pkgs shell; }
+// { share-helper = import ./share.nix { inherit pkgs; }; }
 // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isx86_64 {
   autolith-smoke = mkSmokeTest {
     name = "autolith";

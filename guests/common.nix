@@ -220,14 +220,16 @@ in
     };
 
     # Parses kernel cmdline for llmjail.mounts=tag0:/path:rw,tag1:/path:ro,...
-    # and mounts each entry via virtiofs.
+    # and mounts each entry via virtiofs. Masks and read-only git files are
+    # applied by the host before virtiofsd starts (lib/share.nix), so they
+    # hold whatever happens in here.
     systemd.services.llmjail-mounts = {
       description = "Mount llmjail host shares from kernel cmdline";
       wantedBy = [ "multi-user.target" ];
       before = [ "llmjail-ready.target" ];
       after = [ "local-fs.target" ];
-      # A share or --mask that could not be applied must not leave the session
-      # running unprotected; poweroff-force still syncs.
+      # A share that could not be mounted must not leave a session without its
+      # workspace; poweroff-force still syncs.
       unitConfig.FailureAction = "poweroff-force";
       serviceConfig = {
         Type = "oneshot";
@@ -286,59 +288,6 @@ in
           ${pkgs.coreutils}/bin/cp "$src" "/home/user/$name"
           ${pkgs.coreutils}/bin/chown user:users "/home/user/$name"
         done
-
-        # Apply --mask patterns to user-data roots.
-        # Bind-mounts an empty dir/file over each matched path so the
-        # tool sees no contents (the name stays visible, only contents
-        # are hidden). Static: applied once at boot. New files matching
-        # the pattern after boot are NOT masked.
-        if [ -s /llmjail-env/mask-patterns ] && [ -s /llmjail-env/mask-roots ]; then
-          ${pkgs.coreutils}/bin/mkdir -p /run/llmjail-mask/empty-dir
-          : > /run/llmjail-mask/empty-file
-          ${pkgs.coreutils}/bin/chmod 0555 /run/llmjail-mask/empty-dir
-          ${pkgs.coreutils}/bin/chmod 0444 /run/llmjail-mask/empty-file
-
-          while IFS= read -r root || [ -n "$root" ]; do
-            [ -z "$root" ] && continue
-            [ -d "$root" ] || continue
-
-            EXPR=()
-            while IFS= read -r p || [ -n "$p" ]; do
-              [ -z "$p" ] && continue
-              if [ ''${#EXPR[@]} -gt 0 ]; then EXPR+=("-o"); fi
-              case "$p" in
-                */*) EXPR+=("-path" "$root/$p") ;;
-                *)   EXPR+=("-name" "$p") ;;
-              esac
-            done < /llmjail-env/mask-patterns
-
-            [ ''${#EXPR[@]} -eq 0 ] && continue
-
-            # -xdev keeps the walk inside the root's filesystem (the
-            # share mount), so we never wander into nested mounts.
-            # -prune skips descent into matched dirs (cheap on big trees).
-            ${pkgs.findutils}/bin/find "$root" -xdev \( "''${EXPR[@]}" \) -prune -print0 |
-              while IFS= read -r -d "" target; do
-                [ "$target" = "$root" ] && continue
-                # Skip symlinks: mount --bind resolves the link, and we don't
-                # want to mask the target instead of the link itself.
-                # Notify the user and skip.
-                if [ -L "$target" ]; then
-                  echo "mask: skipping symlink (not masked): $target"
-                  continue
-                fi
-                if [ -d "$target" ]; then
-                  ${pkgs.util-linux}/bin/mount --bind /run/llmjail-mask/empty-dir "$target"
-                elif [ -e "$target" ]; then
-                  ${pkgs.util-linux}/bin/mount --bind /run/llmjail-mask/empty-file "$target"
-                else
-                  continue
-                fi
-                ${pkgs.util-linux}/bin/mount -o remount,bind,ro "$target"
-                echo "masked: $target"
-              done
-          done < /llmjail-env/mask-roots
-        fi
       '';
     };
 

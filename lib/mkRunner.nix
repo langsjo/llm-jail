@@ -13,6 +13,7 @@ let
   qemuPkg = pkgs.qemu_kvm;
   arch = if pkgs.stdenv.hostPlatform.isx86_64 then "x86_64" else "aarch64";
   allowedDomains = toolDefaults.allowedDomains ++ guest.config.llmjail.extraAllowedDomains;
+  share = import ./share.nix { inherit pkgs; };
 in
 pkgs.writeShellApplication {
   name = "llm-jail-${name}";
@@ -84,8 +85,9 @@ pkgs.writeShellApplication {
                             GLOB with '/' uses -path "<root>/GLOB" (matches across
                             subdirs, e.g. 'a/*' also hits 'a/b/c'); else -name GLOB.
                             Matched paths appear empty and read-only; the name stays
-                            visible, only the contents are hidden.
-                            Applied at boot only; new matches post-boot are not masked.
+                            visible, only the contents are hidden. Applied on the host
+                            at startup: paths created later, symlinks, other hard
+                            links and git history (git show HEAD:FILE) are not masked.
       --nix-env             Capture nix develop environment from workspace flake
       --devenv              Capture devenv.sh shell environment from workspace
       --disk SIZE           Use an ext4 disk (SIZE in GB) as the root filesystem
@@ -441,7 +443,7 @@ pkgs.writeShellApplication {
       # workspace's own devenv.nix shellHook runs on the host as part of
       # `direnv-export` (same trust model as `nix develop`/
       # `nix print-dev-env` on an untrusted flake), and $SHAREDIR holds
-      # allowed-domains/mask-patterns/tool-args/env - files the guest
+      # allowed-domains/tool-args/env - files the guest
       # treats as the trust boundary for its network allowlist and
       # secrets, staged there before this step runs. A shellHook that
       # discovers $XDG_RUNTIME_DIR could otherwise read or tamper with
@@ -463,7 +465,6 @@ pkgs.writeShellApplication {
     MOUNT_IDX=0
     MOUNT_CMDLINE=""
     SHARE_ARGS=()
-    MASK_ROOTS=()
 
     # One virtiofsd per share (it serves a single directory), started as
     # the invoking user - no root needed. --sandbox=namespace pivot_roots
@@ -488,14 +489,28 @@ pkgs.writeShellApplication {
 
     # Exports HOSTPATH to the guest under TAG by appending QEMU args to
     # SHARE_ARGS. MODE is rw, ro, ro-nocache, or ro-immutable (contents never
-    # change during the run, e.g. envfs).
+    # change during the run, e.g. envfs). With PROTECT=1 the share is a user
+    # directory: --mask applies to it and, if writable, the git files host git
+    # executes are read-only (lib/share.nix).
     add_share() {
-      local tag="$1" hostpath="$2" mode="$3"
+      local tag="$1" hostpath="$2" mode="$3" protect="''${4:-0}"
+      local root
+      root=$(realpath "$hostpath")
+
+      local share_args=()
+      if [ "$protect" = 1 ]; then
+        for p in "''${MASK_PATTERNS[@]+"''${MASK_PATTERNS[@]}"}"; do
+          share_args+=("--mask" "$p")
+        done
+        if [ "$mode" = rw ]; then
+          share_args+=("--protect-git")
+        fi
+      fi
 
       local sock="$RUNDIR/virtiofsd-$tag.sock"
       local args=(
         "--socket-path=$sock"
-        "--shared-dir=$(realpath "$hostpath")"
+        "--shared-dir=$root"
         "--sandbox=namespace"
         "--log-level=error"
         "--translate-uid=squash-guest:0:$HOST_UID:4294967295"
@@ -523,7 +538,10 @@ pkgs.writeShellApplication {
       # once QEMU starts. Printed by print_guest_logs, only on failure.
       local log="$RUNDIR/virtiofsd-$tag.log"
       # Own session: a Ctrl-C to the terminal's process group must not reach it.
-      setpriv --pdeathsig KILL -- setsid -- virtiofsd "''${args[@]}" 2>"$log" &
+      # None of these fork, so $! stays virtiofsd's pid.
+      setpriv --pdeathsig KILL -- setsid -- \
+        ${share}/bin/llmjail-share "''${share_args[@]+"''${share_args[@]}"}" "$root" -- \
+        virtiofsd "''${args[@]}" 2>"$log" &
       VIRTIOFSD_PIDS+=($!)
 
       # QEMU fails outright if the socket isn't there yet
@@ -533,9 +551,12 @@ pkgs.writeShellApplication {
         sleep 0.05
       done
       if [ ! -S "$sock" ]; then
-        echo "ERROR: virtiofsd did not start for $hostpath (ensure unprivileged user namespaces are allowed)" >&2
+        echo "ERROR: virtiofsd did not start for $hostpath (ensure unprivileged user namespaces are allowed):" >&2
+        cat -v "$log" >&2
         exit 1
       fi
+      # e.g. a --mask that matched a symlink
+      grep '^llmjail-share: ' "$log" >&2 || true
 
       SHARE_ARGS+=(
         "-chardev" "socket,id=fs-$tag,path=$sock"
@@ -547,12 +568,13 @@ pkgs.writeShellApplication {
     add_share nix-store /nix/store ro
     add_share envfs "$SHAREDIR" ro-immutable
 
+    # PROTECT as for add_share.
     add_mount() {
-      local hostpath="$1" guestpath="$2" mode="$3"
+      local hostpath="$1" guestpath="$2" mode="$3" protect="''${4:-0}"
       local tag="mount''${MOUNT_IDX}"
       MOUNT_IDX=$((MOUNT_IDX + 1))
 
-      add_share "$tag" "$hostpath" "$mode"
+      add_share "$tag" "$hostpath" "$mode" "$protect"
 
       if [ -n "$MOUNT_CMDLINE" ]; then
         MOUNT_CMDLINE="$MOUNT_CMDLINE,$tag:$guestpath:$mode"
@@ -563,14 +585,10 @@ pkgs.writeShellApplication {
 
     validate_path "$(pwd)" "workspace path"
     if [[ "$IMMUTABLE" -eq 1 ]]; then
-      add_mount "$(pwd)" "$WORKSPACE_DIR" "ro-nocache"
+      add_mount "$(pwd)" "$WORKSPACE_DIR" "ro-nocache" 1
     else
-      add_mount "$(pwd)" "$WORKSPACE_DIR" "rw"
-      if [[ -d "$(pwd)/.git/hooks" ]]; then
-        add_mount "$(pwd)/.git/hooks" "$WORKSPACE_DIR/.git/hooks" "ro-nocache"
-      fi
+      add_mount "$(pwd)" "$WORKSPACE_DIR" "rw" 1
     fi
-    MASK_ROOTS+=("$WORKSPACE_DIR")
 
     validate_path "$STATE_DIR" "state directory"
     # virtiofsd refuses to share a non-existent path; first run starts empty and
@@ -651,25 +669,8 @@ pkgs.writeShellApplication {
       fi
       validate_path "$hostpath" "mount path"
       validate_path "$guestpath" "mount path"
-      add_mount "$hostpath" "$guestpath" "$mode"
-      MASK_ROOTS+=("$guestpath")
+      add_mount "$hostpath" "$guestpath" "$mode" 1
     done
-
-    for p in "''${MASK_PATTERNS[@]+"''${MASK_PATTERNS[@]}"}"; do
-      case "$p" in
-        *$'\n'*) echo "ERROR: --mask must not contain newlines: $p" >&2; exit 1 ;;
-      esac
-    done
-    if [ ''${#MASK_PATTERNS[@]} -gt 0 ]; then
-      printf '%s\n' "''${MASK_PATTERNS[@]}" > "$SHAREDIR/mask-patterns"
-    else
-      : > "$SHAREDIR/mask-patterns"
-    fi
-    if [ ''${#MASK_ROOTS[@]} -gt 0 ]; then
-      printf '%s\n' "''${MASK_ROOTS[@]}" > "$SHAREDIR/mask-roots"
-    else
-      : > "$SHAREDIR/mask-roots"
-    fi
 
     KERNEL_PARAMS="$(cat ${toplevel}/kernel-params) init=${toplevel}/init llmjail.mounts=$MOUNT_CMDLINE"
 

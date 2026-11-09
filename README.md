@@ -94,6 +94,7 @@ llm-jail-{claude,codex,copilot,opencode,autolith,pi,shell} [options] [-- tool-ar
 | `--tmpdir PATH` | Directory to use for runtime data | `${TMPDIR:-/tmp}` |
 | `--mount PATH` | Extra read-write mount (repeatable) | - |
 | `--ro-mount PATH` | Extra read-only mount (repeatable) | - |
+| `--mask GLOB` | Hide paths matching GLOB in the workspace and mounts (repeatable); see [Masks](#masks) | - |
 | `--nix-env` | Capture `nix develop` environment from workspace | off |
 | `--devenv` | Capture `devenv.sh` shell environment from workspace | off |
 | `--disk SIZE` | Use an ext4 disk (SIZE in GB) as the root filesystem instead of RAM | off |
@@ -241,6 +242,16 @@ The shell tool honors `$SHELL` (resolved through symlinks so the `/nix/store` pa
 - Any directories added via `--mount` / `--ro-mount`
 
 All other host paths are invisible to the guest. Changes outside mounted directories are lost when the VM shuts down.
+
+**Files host git executes.** Host git runs code named in a repository's config (`core.hooksPath`, `core.fsmonitor`, `core.sshCommand`, filter drivers) and its hooks. In every writable share that is a git repository, these are read-only in the jail: `.git/config`, `.git/config.worktree`, `.git/hooks` (created empty if missing), the same in each submodule's gitdir under `.git/modules`, and `.git/worktrees/*/config.worktree` (also when `.git` is a `gitdir:` file pointing inside the share). Commits, branches and other git work still happen in the jail; commands that write `.git/config` (`git remote add`, `git push -u`, setting an upstream) fail there with "Read-only file system". Not covered: other repositories nested inside the workspace, and repositories the agent creates; don't run host git in those.
+
+#### Masks
+
+`--mask GLOB` hides matching paths in the workspace and in every `--mount`/`--ro-mount`. A GLOB with a `/` matches with `find -path "<root>/GLOB"` (so `a/*` also hits `a/b/c`), any other GLOB with `find -name GLOB` at any depth. Matched paths appear empty and read-only; the name stays visible. Masks are applied on the host before the VM starts, in the file server's own mount namespace, so nothing in the guest can see past them. Not masked:
+
+- paths created after the VM started (the patterns are expanded once, at startup)
+- symlinks (skipped with a message), and other hard links to a masked file
+- contents reachable another way, such as git history (`git show HEAD:.env` for a tracked file)
 
 On NixOS hosts, system packages (`/run/current-system/sw`) and user packages (`/etc/profiles/per-user/$USER`) are automatically mounted and added to PATH, so tools like `jj`, `ripgrep`, etc. are available without hardcoding them in the guest.
 

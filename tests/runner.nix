@@ -107,6 +107,43 @@ let
     exit 0
   '';
 
+  # Tries to read masked paths and to write the files host git executes.
+  # As root it also unmounts them and mounts the workspace share a second
+  # time, and tries everything again through that mount. Prints
+  # "<check>: held" or "<check>: BYPASSED", then whether git still commits.
+  protectProbe = pkgs.writeShellScript "llmjail-probe-protect" ''
+    t() {
+      if eval "$2" >/dev/null 2>&1; then echo "$1: BYPASSED"; else echo "$1: held"; fi
+    }
+    {
+      roots=(/workspace)
+      if [ "$(id -u)" = 0 ]; then
+        for p in .env sub/.env secrets .git/config .git/hooks; do
+          umount "/workspace/$p" 2>/dev/null || true
+        done
+        mkdir -p /mnt/again
+        mount -t virtiofs mount0 /mnt/again
+        roots+=(/mnt/again)
+      fi
+      for root in "''${roots[@]}"; do
+        t "$root read .env" '[ -n "$(cat $root/.env)" ]'
+        t "$root read sub/.env" '[ -n "$(cat $root/sub/.env)" ]'
+        t "$root list secrets" '[ -n "$(ls -A $root/secrets)" ]'
+        t "$root write .env" 'echo x > $root/.env'
+        t "$root rm .env" 'rm $root/.env'
+        t "$root write config" 'echo "[core] fsmonitor = touch /tmp/pwned" >> $root/.git/config'
+        t "$root replace config" 'cp $root/.git/config $root/c && mv $root/c $root/.git/config'
+        t "$root write hook" 'echo "touch /tmp/pwned" > $root/.git/hooks/pre-commit'
+        t "$root write submodule config" 'echo x >> $root/.git/modules/sub-repo/config'
+        t "$root write submodule hook" 'touch $root/.git/modules/sub-repo/hooks/post-checkout'
+      done
+      ${pkgs.git}/bin/git config --global safe.directory '*'
+      ${pkgs.git}/bin/git -C /workspace -c user.name=t -c user.email=t@t \
+        commit -q --allow-empty -m from-the-jail && echo "commit: ok"
+    } > /workspace/protect-checks
+    exit 0
+  '';
+
   # Records what the rc and the command line resolved to.
   rcProbe = pkgs.writeShellScript "llmjail-probe-rc" ''
     nproc > vcpus
@@ -415,6 +452,42 @@ in
           jail("${rcProbe}", setup=rc_setup("--vcpu 1 -- rc-arg", approve=False), args="--norc --vcpu 2 -- cli-arg")
           expect(ws("vcpus"), "^2$", "vcpus")
           expect(ws("tool-args"), r"^cli-arg\|$", "tool-args")
+    '';
+  };
+
+  # --mask and the protected git files, as seen from the guest. The logic
+  # itself is tested without a VM in tests/share.nix.
+  runner-protect = mkVmTest {
+    name = "protect";
+    testScript = _: ''
+      repo_setup = """
+        git init -q -b main .
+        git init -q -b main ../sub-src
+        git -C ../sub-src -c user.name=t -c user.email=t@t commit -q --allow-empty -m sub
+        git -c protocol.file.allow=always submodule -q add ../sub-src sub-repo
+        git -c user.name=t -c user.email=t@t commit -q -m init
+        echo secret > .env
+        mkdir -p sub secrets
+        echo secret > sub/.env
+        echo secret > secrets/key
+        sha256sum .git/config .git/modules/sub-repo/config > ~/before
+      """
+
+      def check_protected(args, expected_checks):
+          jail("${protectProbe}", setup=repo_setup, args=f"{args} --mask .env --mask secrets")
+          checks = ws("protect-checks")
+          print(checks)
+          assert "BYPASSED" not in checks, checks
+          assert checks.count(": held") == expected_checks, f"not every check ran:\n{checks}"
+          assert "commit: ok" in checks, f"git commit failed in the jail:\n{checks}"
+          # The host's copies are untouched, and the jail's commit is there.
+          host.succeed("cd ~alice/ws && sha256sum -c --quiet ~alice/before")
+          host.succeed("grep -qx secret ~alice/ws/.env ~alice/ws/sub/.env ~alice/ws/secrets/key")
+          host.fail("find ~alice/ws/.git/hooks ~alice/ws/.git/modules/sub-repo/hooks -type f ! -name '*.sample' | grep .")
+          host.succeed("su - alice -c 'git -C ~/ws log --format=%s' | grep -qx from-the-jail")
+
+      with subtest("masks and git files hold"):
+          check_protected("", 10)
     '';
   };
 
