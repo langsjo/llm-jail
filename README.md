@@ -309,7 +309,7 @@ Root can do anything inside the guest, but every boundary of the jail is enforce
 - **Files:** each shared directory is served by its own `virtiofsd`, running as you in a user namespace. Read-only shares and read-only git files are refused by the server, masked paths are hidden from it, and guest uids are squashed to yours, so root in the guest can do exactly what your user can do in the writable shares and nothing more.
 - **VM lifetime:** the runner kills QEMU if the guest does not power off within 15 s of the session ending.
 
-What root does change is how directly the agent can reach the virtual machine monitor: root can drive virtual devices itself, so a bug in QEMU or virtiofsd is easier to hit, and such an escape is code execution as your user on the host.
+What root does change is how directly the agent can reach the virtual machine monitor: root can drive virtual devices itself, so a bug in QEMU or virtiofsd is easier to hit, and such an escape is code execution as your user on the host. To narrow that, QEMU runs with no Linux capabilities, under its seccomp sandbox (`-sandbox on` with obsolete syscalls, privilege changes, spawning and resource control denied), and with only the devices the jail uses (`-nodefaults`).
 
 ## Dangerous mode
 
@@ -355,7 +355,7 @@ What root does change is how directly the agent can reach the virtual machine mo
 +------------------------------------------------+
 ```
 
-No persistent disk images are involved. The guest kernel and initrd are built by NixOS and passed to QEMU via `-kernel` / `-initrd`. The host Nix store is shared read-only over virtiofs and used directly as the lower layer of a `/nix/store` overlay whose upper layer lives on the root filesystem. The root is a tmpfs by default; with `--disk` it is a sparse ext4 image instead, so everything the guest writes outside the host mounts (new store paths, `/nix/var/nix/builds/`, `$HOME` caches, Docker images) lands on disk rather than in RAM. The image is cleaned up automatically when the VM exits. If the VM fails to boot or the connection is lost, the runner prints the QEMU log and the tail of the guest's kernel and journal log.
+No persistent disk images are involved. The guest kernel and initrd are built by NixOS and passed to QEMU via `-kernel` / `-initrd`. The host Nix store is shared read-only over virtiofs and used directly as the lower layer of a `/nix/store` overlay whose upper layer lives on the root filesystem. The root is a tmpfs by default; with `--disk` it is a sparse ext4 image instead, so everything the guest writes outside the host mounts (new store paths, `/nix/var/nix/builds/`, `$HOME` caches, Docker images) lands on disk rather than in RAM. The image is cleaned up automatically when the VM exits. If the VM fails to boot or the connection is lost, the runner prints the QEMU log, the virtiofsd logs, and the tail of dnsmasq's query log and of the guest's kernel and journal log, with control characters escaped so guest-written text cannot drive your terminal.
 
 ## Overriding tool packages
 
