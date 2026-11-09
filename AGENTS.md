@@ -7,8 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 nix build .#claude              # Build the runner script
 nix run .#claude -- --help      # Show CLI usage
-nix flake check                 # Validate flake structure
+nix flake check                 # Validate flake structure and run all tests
 ```
+
+The runner tests that boot a jail (`runner-boot`, `runner-rc`, `runner-lifecycle` in `tests/runner.nix`) run inside NixOS test VMs, where a `host` VM runs the runner as an unprivileged user, the way a real host does. The jail is then a nested VM, so they need nested KVM to be fast. Build one with e.g. `nix build -L .#checks.x86_64-linux.runner-boot`.
 
 End-to-end test (needs a terminal and a prior in-jail login - run `nix run .#claude` once and complete the login flow, which persists credentials in `~/.config/llm-jail/claude/default`):
 ```bash
