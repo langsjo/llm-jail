@@ -3,7 +3,7 @@
 #
 # Rootless rather than the stock rootful daemon: access to a rootful
 # daemon's socket is root-equivalent in the guest, which would let the agent
-# flush the network filter's nftables rules or unmount the --mask overlays.
+# flush the network filter's nftables rules.
 # Rootless dockerd runs as `user` inside a user namespace, and container
 # egress leaves through slirp4netns as ordinary sockets owned by `user`, so it
 # goes through the same output-chain filter, and resolves through the same
