@@ -1,6 +1,8 @@
 { config, lib, pkgs, nixpkgs-rolling, ... }:
 
 let
+  addr = import ../lib/addresses.nix;
+
   # Read-only boot-time share (store lower layer, envfs). Caching is chosen
   # host-side by virtiofsd's --cache.
   roBootShare = device: {
@@ -105,6 +107,7 @@ in
     # autoload, but the systemd-initrd path doesn't always trigger it for
     # `mount -t overlay`, so make it explicit.
     boot.initrd.kernelModules = [ "overlay" ];
+    # nf_tables for rootless Docker, whose user namespace cannot load modules.
     boot.kernelModules = [ "nf_tables" "virtio_console" ];
 
     # roBootShare mounts are ordered after this unit, which the initrd neither
@@ -169,15 +172,16 @@ in
     # Read-only and immutable during the run, so it is cached aggressively.
     fileSystems."/llmjail-env" = roBootShare "envfs";
 
+    # The NIC is a tap in a per-run network namespace on the host, which
+    # holds the network filter and the DNS server (dnsmasq, answering only
+    # allowed names; lib/net.nix). Nothing in the guest enforces anything:
+    # changing this config, even as root, reaches nothing more.
     networking.useDHCP = false;
-    networking.nameservers = [ "10.0.2.3" ];
+    networking.nameservers = [ addr.gateway ];
     networking.firewall.enable = false;
 
-    # nixos-26.05 + systemd-networkd auto-enables resolved, which inserts
-    # "resolve" before "dns" in nsswitch and steals all hostname lookups
-    # to its own stub on 127.0.0.53/54. That bypasses our dnsmasq on
-    # 127.0.0.1, so nftset additions never happen. Force it off so glibc
-    # falls back to the "dns" NSS module and reads /etc/resolv.conf.
+    # nixos-26.05 + systemd-networkd auto-enables resolved, which would put its
+    # own stub in front of the host's dnsmasq. Keep glibc on /etc/resolv.conf.
     services.resolved.enable = false;
 
     # Gives interface name "eth0"
@@ -186,7 +190,8 @@ in
       enable = true;
       networks."eth0" = {
         matchConfig.Name = "eth0";
-        networkConfig.DHCP = "yes";
+        address = [ "${addr.guest}/${toString addr.prefixLength}" ];
+        gateway = [ addr.gateway ];
       };
       wait-online.enable = true;
     };
@@ -303,108 +308,7 @@ in
       gnused
       gawk
       diffutils
-      dnsmasq
-      nftables
     ];
-
-    # Configures DNS whitelist (dnsmasq) and port-level firewall (nftables)
-    # when llmjail.net_filter=1 is set on the kernel cmdline.
-    systemd.services.llmjail-net-filter = {
-      description = "llmjail network filter (DNS whitelist + nftables)";
-      wantedBy = [ "multi-user.target" ];
-      after = [ "llmjail-mounts.service" "network-online.target" ];
-      wants = [ "network-online.target" ];
-      before = [ "llmjail-ready.target" ];
-      unitConfig.FailureAction = "poweroff-force";
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-      };
-      script = ''
-        set -euo pipefail
-
-        NET_FILTER=0
-        for arg in $(cat /proc/cmdline); do
-          case "$arg" in
-            llmjail.net_filter=1) NET_FILTER=1 ;;
-          esac
-        done
-
-        if [ "$NET_FILTER" != "1" ]; then
-          echo "Network filtering disabled."
-          exit 0
-        fi
-
-        # Must run before dnsmasq so allowed_ips set exists when
-        # dnsmasq populates it on first DNS resolution.
-        ${pkgs.nftables}/bin/nft -f - <<'NFTEOF'
-        table inet llmjail_filter {
-          # Populated by dnsmasq --nftset on each successful DNS resolution.
-          # HTTP/HTTPS is only allowed to IPs that appear here, blocking
-          # direct hardcoded-IP connections that bypass DNS filtering.
-          # Plain set (no `flags interval`) so dnsmasq can add individual
-          # /32 entries - interval sets reject single addresses in some
-          # nft/dnsmasq combos.
-          set allowed_ips {
-            type ipv4_addr
-          }
-
-          chain output {
-            type filter hook output priority 0; policy drop;
-
-            oifname "lo" accept
-
-            ct state established,related accept
-
-            udp dport { 67, 68 } accept
-
-            ip daddr 10.0.2.3 udp dport 53 meta skuid root accept
-            ip daddr 10.0.2.3 tcp dport 53 meta skuid root accept
-
-            ip daddr @allowed_ips tcp dport { 80, 443 } accept
-
-            log prefix "llmjail-drop: " drop
-          }
-        }
-        NFTEOF
-
-        DNSMASQ_CONF="/etc/dnsmasq-llmjail.conf"
-        {
-          echo "no-resolv"
-          echo "no-hosts"
-          echo "listen-address=127.0.0.1"
-          echo "bind-interfaces"
-
-          # Forward allowed domains to QEMU's DNS; populate nftables set
-          # on each successful resolution so the IP becomes reachable.
-          if [ -f /llmjail-env/allowed-domains ]; then
-            while IFS= read -r domain || [ -n "$domain" ]; do
-              [ -z "$domain" ] && continue
-              echo "server=/$domain/10.0.2.3"
-              echo "nftset=/$domain/4#inet#llmjail_filter#allowed_ips"
-            done < /llmjail-env/allowed-domains
-          fi
-
-          # No default upstream - unmatched queries get REFUSED
-        } > "$DNSMASQ_CONF"
-
-        # --user=root keeps CAP_NET_ADMIN for the lifetime of the daemon;
-        # dnsmasq otherwise drops to "nobody" and nftset updates fail
-        # silently. We're inside a jail VM, root for dnsmasq is fine.
-        # --log-queries surfaces the nftset add events in journalctl so
-        # future filter regressions are debuggable from the guest.
-        ${pkgs.dnsmasq}/bin/dnsmasq \
-          --conf-file="$DNSMASQ_CONF" \
-          --pid-file=/run/dnsmasq-llmjail.pid \
-          --user=root \
-          --log-queries=extra \
-          --log-facility=-
-
-        echo "nameserver 127.0.0.1" > /etc/resolv.conf
-
-        echo "Network filtering enabled with $(${pkgs.coreutils}/bin/wc -l < /llmjail-env/allowed-domains) allowed domain(s)."
-      '';
-    };
 
     # The tool runs in an ssh session over the llmjail.ssh virtserialport.
     # The NixOS module supplies sshd_config, PAM, the privsep user and the
@@ -435,8 +339,8 @@ in
     systemd.targets.llmjail-ready = {
       description = "llmjail guest setup finished";
       wantedBy = [ "multi-user.target" ];
-      requires = [ "llmjail-mounts.service" "llmjail-net-filter.service" ];
-      after = [ "llmjail-mounts.service" "llmjail-net-filter.service" ];
+      requires = [ "llmjail-mounts.service" ];
+      after = [ "llmjail-mounts.service" ];
     };
 
     # One sshd -i serving the single connection the runner's ssh master opens.

@@ -1,14 +1,13 @@
 # Rootless Docker, added by the `docker` build-time argument
 # (`nix run .#claude.docker`).
 #
-# Rootless rather than the stock rootful daemon: access to a rootful
-# daemon's socket is root-equivalent in the guest, which would let the agent
-# flush the network filter's nftables rules.
-# Rootless dockerd runs as `user` inside a user namespace, and container
-# egress leaves through slirp4netns as ordinary sockets owned by `user`, so it
-# goes through the same output-chain filter, and resolves through the same
-# dnsmasq allowlist (slirp4netns forwards DNS to the nameserver in
-# /etc/resolv.conf), as the tool itself.
+# Rootless rather than the stock rootful daemon, whose socket is
+# root-equivalent in the guest. That no longer weakens the jail (its network
+# filter, masks and protected git files are enforced on the host), but it
+# keeps a default run free of root. Container traffic leaves through
+# slirp4netns and the guest's NIC, so the host's filter applies to it
+# unchanged, and it resolves through the same nameserver (slirp4netns
+# forwards DNS to the one in /etc/resolv.conf).
 #
 # The daemon is NixOS's rootless user unit, run by `user`'s systemd user
 # manager, which lingering starts at boot.
@@ -43,12 +42,9 @@
   };
 
   # linger-users starts user@<uid>, and with it the daemon. It resolves `user`
-  # to a uid when it does, so it must run after the remap to the host uid; and
-  # after the net filter has pointed /etc/resolv.conf at dnsmasq, which
-  # slirp4netns forwards container DNS to. The data root is created here
-  # because it needs root and the remapped uid.
+  # to a uid when it does, so it must run after the remap to the host uid.
   systemd.services.linger-users = {
-    after = [ "llmjail-set-user-uid.service" "llmjail-net-filter.service" ];
+    after = [ "llmjail-set-user-uid.service" ];
   };
 
   # user@<uid> reports ready at the user manager's basic.target, before the

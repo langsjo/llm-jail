@@ -4,7 +4,8 @@
 # plain derivations. Tests that boot a jail run in the NixOS test framework,
 # where a `host` VM runs the runner the way a real host does, as an
 # unprivileged user with KVM (the jail is a nested VM, so nested KVM keeps
-# them fast).
+# them fast). The network test adds an `internet` VM that serves DNS, HTTP
+# and a UDP sink.
 #
 # The shell tool execs the host's $SHELL (forwarded by the runner), so
 # pointing $SHELL at a probe script makes the tool session run the probe
@@ -95,8 +96,7 @@ let
     findmnt / > root
     findmnt /nix/store > store
     findmnt /workspace > share
-    # Every TCP listener except the guest's dnsmasq on port 53
-    ${pkgs.iproute2}/bin/ss -Htln | grep -v ":53 " > tcp
+    ${pkgs.iproute2}/bin/ss -Htln > tcp
     stat -L -c '%a %U' /dev/virtio-ports/llmjail.ssh > port
     id -un > whoami
     id -Gn > groups
@@ -143,6 +143,46 @@ let
     } > /workspace/protect-checks
     exit 0
   '';
+
+  # Prints "<check>: open" or "<check>: closed" for each way out it tries.
+  # Run as user and as root; root additionally rewrites its own network
+  # setup, which must change nothing.
+  networkProbe =
+    { internet, evil }:
+    pkgs.writeShellScript "llmjail-probe-network" ''
+      curl() { ${pkgs.curl}/bin/curl "$@"; }
+      t() {
+        if eval "$2" >/dev/null 2>&1; then echo "$1: open"; else echo "$1: closed"; fi
+      }
+      {
+        t allowed-http 'curl -sf -m10 http://allowed.test/ | grep -q hello-from-internet'
+        t evil-dns 'getent hosts evil.test'
+        t evil-http 'curl -sf -m5 http://${evil}/'
+        # dig prints its errors on stdout too, so look for an address.
+        t direct-dns '${pkgs.dig}/bin/dig +short +time=2 +tries=1 @${internet} evil.test | grep -qx "${evil}"'
+        # Grepping for the host's own service: other answers on the port are
+        # not a leak.
+        t host-loopback-via-gateway 'curl -s -m3 http://${internet}:8080/ | grep -q HOSTLOOPBACK'
+        t host-loopback-via-namespace 'curl -s -m3 http://192.0.2.1:8080/ | grep -q HOSTLOOPBACK'
+        t metadata 'curl -sf -m3 http://169.254.169.254/'
+        # Checked on the internet node: this never fails on the sending side.
+        echo udp-leak | ${pkgs.socat}/bin/socat -u - UDP:${internet}:9999
+        if [ "$(id -u)" = 0 ]; then
+          echo "nameserver ${internet}" > /etc/resolv.conf
+          t root-dns-via-own-resolver 'getent hosts evil.test'
+          ip addr add 192.0.2.99/24 dev eth0
+          t root-http-from-other-address 'curl -sf -m5 --interface 192.0.2.99 http://${evil}/'
+        fi
+      } > /workspace/net
+      # Context for a failing run
+      {
+        cat /etc/resolv.conf
+        ip route
+        getent hosts allowed.test
+        curl -sv -m10 http://allowed.test/
+      } > /workspace/net-debug 2>&1
+      exit 0
+    '';
 
   # Records what the rc and the command line resolved to.
   rcProbe = pkgs.writeShellScript "llmjail-probe-rc" ''
@@ -259,6 +299,46 @@ let
         + testScript args;
     };
 
+  # Serves DNS for allowed.test and evil.test (on different addresses, so the
+  # IP allowlist can tell them apart), HTTP on every address including the
+  # cloud metadata one, and a UDP sink.
+  internetNode =
+    { config, pkgs, ... }:
+    {
+      networking.firewall.enable = false;
+      networking.interfaces.eth1.ipv4.addresses = [
+        {
+          address = "192.168.1.200";
+          prefixLength = 24;
+        }
+        {
+          address = "169.254.169.254";
+          prefixLength = 32;
+        }
+      ];
+      services.dnsmasq = {
+        enable = true;
+        resolveLocalQueries = false;
+        settings = {
+          no-resolv = true;
+          address = [
+            "/allowed.test/${config.networking.primaryIPAddress}"
+            "/evil.test/192.168.1.200"
+          ];
+        };
+      };
+      services.nginx = {
+        enable = true;
+        virtualHosts.default = {
+          default = true;
+          locations."/".return = "200 hello-from-internet";
+        };
+      };
+      systemd.services.udp-sink = {
+        wantedBy = [ "multi-user.target" ];
+        script = "${pkgs.socat}/bin/socat -u UDP-RECV:9999 OPEN:/tmp/udp-received,creat,append";
+      };
+    };
 in
 {
   # ---------------------------------------------------------------------------
@@ -491,6 +571,88 @@ in
     '';
   };
 
+  # The network policy, enforced on the host, filtered and not. `internet` stands in for everything outside the host.
+  runner-network = mkVmTest {
+    name = "network";
+    nodes.internet = internetNode;
+    host =
+      { nodes, ... }:
+      {
+        networking.nameservers = [ nodes.internet.networking.primaryIPAddress ];
+        networking.defaultGateway = nodes.internet.networking.primaryIPAddress;
+        # A service on the host's loopback, which the guest must never reach.
+        systemd.services.host-loopback = {
+          wantedBy = [ "multi-user.target" ];
+          script = "${pkgs.socat}/bin/socat TCP-LISTEN:8080,bind=127.0.0.1,fork,reuseaddr SYSTEM:'echo HTTP/1.0 200 OK; echo; echo HOSTLOOPBACK'";
+        };
+      };
+    testScript =
+      { nodes, ... }:
+      let
+        internet = nodes.internet.networking.primaryIPAddress;
+        probe = networkProbe {
+          inherit internet;
+          evil = "192.168.1.200";
+        };
+      in
+      ''
+        internet.wait_for_unit("dnsmasq.service")
+        internet.wait_for_unit("nginx.service")
+        internet.wait_for_unit("udp-sink.service")
+        host.wait_for_unit("host-loopback.service")
+
+        # Positive controls: from the host itself, everything the guest is
+        # denied is reachable, so a closed result below is the jail's doing.
+        host.succeed("curl -sf http://allowed.test/ | grep -q hello-from-internet")
+        host.succeed("curl -sf http://evil.test/")
+        host.succeed("curl -sf http://169.254.169.254/")
+        host.succeed("curl -s http://127.0.0.1:8080/ | grep -q HOSTLOOPBACK")
+        host.succeed("echo udp-control | socat -u - UDP:${internet}:9999")
+        internet.wait_until_succeeds("grep -q udp-control /tmp/udp-received", timeout=30)
+
+        def checks(args):
+            # Truncate, not rm: socat keeps writing to the file it opened at start.
+            internet.succeed("truncate -s 0 /tmp/udp-received")
+            log = jail("${probe}", args=args)
+            print(log)
+            print(ws("net-debug"))
+            results = dict(line.split(": ") for line in ws("net").splitlines())
+            udp = internet.succeed("cat /tmp/udp-received")
+            results["udp"] = "open" if "udp-leak" in udp else "closed"
+            return results
+
+        def assert_results(results, expected):
+            print(results)
+            wrong = {k: f"expected {v}, got {results.get(k)}" for k, v in expected.items() if results.get(k) != v}
+            assert not wrong, f"wrong: {wrong}"
+
+        closed_always = {
+            "host-loopback-via-gateway": "closed",
+            "host-loopback-via-namespace": "closed",
+            "metadata": "closed",
+        }
+        filtered = {
+            "allowed-http": "open",
+            "evil-dns": "closed",
+            "evil-http": "closed",
+            "direct-dns": "closed",
+            "udp": "closed",
+        } | closed_always
+
+        with subtest("filtered"):
+            assert_results(checks("--allow-domain allowed.test"), filtered)
+
+        with subtest("unfiltered: everything but the host and link-local"):
+            assert_results(checks("--no-net-filter"), {
+                "allowed-http": "open",
+                "evil-dns": "open",
+                "evil-http": "open",
+                "direct-dns": "open",
+                "udp": "open",
+            } | closed_always)
+      '';
+  };
+
   # Ctrl-C, the inspection shell, and that nothing outlives the run.
   runner-lifecycle = mkVmTest {
     name = "lifecycle";
@@ -516,7 +678,7 @@ in
             [ -e started ] || fail "session did not start"
             # The anchors keep the ssh master, whose arguments contain the socat path, from matching.
             runner_sid=$(ps -o sid= -p $runner)
-            for pat in '^qemu-system-[^ ]* .*/tmp/' '^[^ ]*/bin/socat - UNIX-CONNECT:/tmp/'; do
+            for pat in '^qemu-system-[^ ]* .*/tmp/' '^[^ ]*/bin/socat - UNIX-CONNECT:/tmp/' '^[^ ]*pasta '; do
               pids=$(pgrep -f "$pat") || fail "no process matches /$pat/"
               [ "$(echo "$pids" | wc -l)" = 1 ] || fail "several processes match /$pat/: $pids"
               [ "$(ps -o sid= -p $pids)" != "$runner_sid" ] || fail "/$pat/ runs in the runner's session"
@@ -531,7 +693,7 @@ in
           """)
 
       with subtest("no helper process outlives the run"):
-          host.fail("pgrep -u alice -a 'qemu-system|virtiofsd|socat'")
+          host.fail("pgrep -u alice -a 'qemu-system|pasta|dnsmasq|virtiofsd|socat'")
 
       with subtest("the inspection shell runs as the session's user and ends with it"):
           for args, user in [("", "user")]:

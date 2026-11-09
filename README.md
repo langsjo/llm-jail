@@ -20,7 +20,7 @@ Supported tools:
 - Linux (x86_64 or aarch64)
 - [Nix](https://nixos.org/) with flakes enabled
 - KVM access recommended (falls back to emulation without it)
-- Unprivileged user namespaces (Ubuntu 23.10+ blocks them by default: `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`)
+- Unprivileged user namespaces (Ubuntu 23.10+ blocks them by default: `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`) and `/dev/net/tun`. The jail's boundaries (network filter, masks, protected git files) live in per-run namespaces on the host; the runner refuses to start without them.
 
 No host-side tool credentials are needed: you log in once inside the jail on first run, and the tool's state persists in a jail-private directory under `~/.config/llm-jail/` (see [First run & authentication](#first-run--authentication)).
 
@@ -265,13 +265,15 @@ On NixOS hosts, system packages (`/run/current-system/sw`) and user packages (`/
 
 All other host environment variables are stripped.
 
-**Network.** By default, outbound network access is restricted via DNS-based domain filtering and a port-level firewall:
+**Network.** The guest's network card is a tap device in a per-run network namespace on the host, created by [pasta](https://passt.top) as your user. The filter lives in that namespace, outside the VM, so nothing the agent does in the guest can change it. By default:
 
-- DNS resolution is limited to tool-specific API domains via a local dnsmasq instance
-- Only HTTP/HTTPS traffic (ports 80/443) is allowed outbound; all other protocols are blocked by nftables
+- DNS answers come from a dnsmasq in the namespace that only resolves tool-specific API domains; other names get REFUSED, and the guest cannot reach any other DNS server
+- Only HTTP/HTTPS (TCP 80/443) to addresses dnsmasq resolved for an allowed domain is forwarded; everything else, including all UDP, is refused at once
 - Custom API endpoints (via `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`) are automatically whitelisted
 - Additional domains can be added with `--allow-domain` (subdomains are included automatically)
-- Use `--no-net-filter` to disable all network restrictions
+- Use `--no-net-filter` to lift the restrictions
+
+Filtered or not, the guest can never reach the host's loopback (`127.0.0.0/8`, including services on host `localhost`), link-local addresses (`169.254.0.0/16`, e.g. cloud metadata endpoints), `0.0.0.0/8`, or multicast and reserved ranges.
 
 Default allowed domains per tool:
 
@@ -288,7 +290,7 @@ Default allowed domains per tool:
 
 
 > [!NOTE]
-> Outbound HTTP/HTTPS is restricted to IPs that the guest's dnsmasq resolved through a whitelisted domain - every successful lookup populates an nftables set (`allowed_ips`), and the firewall only accepts packets whose destination is in that set. Connections to hardcoded IPs that bypass DNS hit the default drop. IPv6 outbound traffic is dropped outright (no IPv6 rules). This is robust against accidental or prompt-injected exfiltration as long as the whitelisted domains themselves aren't bidirectional data channels - see the dangerous-mode warning below.
+> Outbound HTTP/HTTPS is restricted to IPs that dnsmasq resolved through a whitelisted domain - every successful lookup adds the addresses to an nftables set, and the filter only forwards packets whose destination is in that set. Connections to hardcoded IPs that bypass DNS are refused. The guest has no IPv6. The filter works on IP addresses, not hostnames: if an allowed domain shares an IP with other sites (common behind CDNs), those sites are reachable too. This is robust against accidental or prompt-injected exfiltration as long as the whitelisted domains themselves aren't bidirectional data channels - see the dangerous-mode warning below.
 
 ## Dangerous mode
 
@@ -315,6 +317,7 @@ Default allowed domains per tool:
 |    - parses CLI args                           |
 |    - writes env vars + tool args to tmpdir     |
 |    - starts one virtiofsd per shared directory |
+|    - pasta netns: tap, nftables, dnsmasq       |
 |    - optionally creates root disk image        |
 |    - launches qemu-system-* in the background  |
 |    - ssh master over a virtio-serial port      |
@@ -327,7 +330,6 @@ Default allowed domains per tool:
 |                                                |
 |  systemd                                       |
 |    -> llmjail-mounts: mount host shares        |
-|    -> llmjail-net-filter: dnsmasq + nftables   |
 |    -> llmjail-sshd: sshd -i -> tool launcher   |
 |                                                |
 |  ExecStopPost: poweroff when ssh closes        |
