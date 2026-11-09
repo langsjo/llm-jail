@@ -31,9 +31,9 @@
   environment.systemPackages = [ pkgs.docker-compose ];
 
   # The module's setSocketVariable derives the socket from XDG_RUNTIME_DIR,
-  # which is not guaranteed in every context. set-environment is sourced by the
-  # launcher and login shells, so $UID expands to the remapped uid there.
-  environment.variables.DOCKER_HOST = "unix:///run/user/$UID/docker.sock";
+  # which is not guaranteed in every context, and $UID would be wrong in a
+  # --root session. llmjail-docker-ready links this path to the daemon's socket.
+  environment.variables.DOCKER_HOST = "unix:///run/llmjail-docker.sock";
 
   users.users.user = {
     # newuidmap/newgidmap map these into the daemon's user namespace
@@ -64,6 +64,7 @@
     script = ''
       sock="/run/user/$(id -u user)/docker.sock"
       until [ -S "$sock" ]; do sleep 0.1; done
+      ln -sfn "$sock" /run/llmjail-docker.sock
     '';
   };
 

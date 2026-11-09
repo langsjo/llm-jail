@@ -243,20 +243,24 @@ in
       script = ''
         set -euo pipefail
 
-        # Per-run ssh key from the runner. Installed before the early exit
-        # below so it also happens without mounts (nixosTest nodes). Root-owned
-        # so sshd's StrictModes passes and the agent cannot edit it.
-        if [ -f /llmjail-env/authorized_keys ]; then
-          ${pkgs.coreutils}/bin/install -D -m 0444 -o root -g root \
-            /llmjail-env/authorized_keys /etc/ssh/authorized_keys.d/user
-        fi
-
         MOUNTS=""
+        LOGIN_USER=user
         for arg in $(cat /proc/cmdline); do
           case "$arg" in
             llmjail.mounts=*) MOUNTS="''${arg#llmjail.mounts=}" ;;
+            llmjail.root=1) LOGIN_USER=root ;;
           esac
         done
+
+        # Per-run ssh key from the runner, for the account the session runs as
+        # (root only with --root; without a key root cannot log in). Installed
+        # before the early exit below so it also happens without mounts
+        # (nixosTest nodes). Root-owned so sshd's StrictModes passes and the
+        # agent cannot edit it.
+        if [ -f /llmjail-env/authorized_keys ]; then
+          ${pkgs.coreutils}/bin/install -D -m 0444 -o root -g root \
+            /llmjail-env/authorized_keys "/etc/ssh/authorized_keys.d/$LOGIN_USER"
+        fi
 
         if [ -z "$MOUNTS" ]; then
           echo "No llmjail mounts specified."
@@ -322,8 +326,10 @@ in
       settings = {
         PasswordAuthentication = false;
         KbdInteractiveAuthentication = false;
-        PermitRootLogin = "no";
-        AllowUsers = [ "user" ];
+        # Key only, and llmjail-mounts installs one for root only with --root
+        # (llmjail.root=1).
+        PermitRootLogin = "prohibit-password";
+        AllowUsers = [ "user" "root" ];
         PrintMotd = false;
         PrintLastLog = false;
         PermitUserRC = false;

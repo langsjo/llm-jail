@@ -41,6 +41,7 @@ pkgs.writeShellApplication {
     MEM="${toString toolDefaults.mem}"
     VCPU="${toString toolDefaults.vcpu}"
     DANGEROUS=0
+    ROOT=0
     NIX_ENV=0
     DEVENV=0
     IMMUTABLE=0
@@ -69,6 +70,9 @@ pkgs.writeShellApplication {
 
     Options:
       --dangerous           Enable the tool's dangerous / unattended mode
+      --root                Run the tool (and inspection shells) as root in the VM.
+                            The network filter, masks and protected git files are
+                            enforced on the host, so root in the VM cannot lift them.
       --profile NAME        State profile, a subdir of --state-dir/<tool> (default: default)
       --state-dir PATH      Jail state root dir (default: ~/.config/llm-jail)
       --immutable           Mount workspace as read-only instead of read-write
@@ -125,6 +129,7 @@ pkgs.writeShellApplication {
       while [ $# -gt 0 ]; do
         case "$1" in
           --dangerous)   DANGEROUS=1; shift ;;
+          --root)        ROOT=1; shift ;;
           --nix-env)     NIX_ENV=1; shift ;;
           --devenv)      DEVENV=1; shift ;;
           --dev-env|--dev-env=*)
@@ -631,9 +636,13 @@ pkgs.writeShellApplication {
     # line), so any other client joins the master or fails at once instead of
     # opening a second connection that nothing would answer. Host-key checking
     # is off: the key changes every boot and the transport is private to us.
+    LOGIN_USER=user
+    if [ "$ROOT" = 1 ]; then
+      LOGIN_USER=root
+    fi
     cat > "$RUNDIR/ssh_config" <<SSHCONFIG
     Host jail
-      User user
+      User $LOGIN_USER
       ProxyCommand false
       ControlPath $RUNDIR/ctl.sock
       IdentityFile $RUNDIR/id
@@ -703,6 +712,11 @@ pkgs.writeShellApplication {
       KERNEL_PARAMS="$KERNEL_PARAMS root=/dev/vda rootfstype=ext4 rw"
     else
       KERNEL_PARAMS="$KERNEL_PARAMS root=tmpfs rootflags=mode=0755"
+    fi
+
+    # Which account llmjail-mounts installs the login key for
+    if [ "$ROOT" = 1 ]; then
+      KERNEL_PARAMS="$KERNEL_PARAMS llmjail.root=1"
     fi
 
     if USER_UID=''${EUID:-$(id -u)} && [[ -n "$USER_UID" ]]; then

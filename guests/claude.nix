@@ -14,6 +14,11 @@
     fi
     ${pkgs.jq}/bin/jq '.projects["/workspace"] = ((.projects["/workspace"] // {}) + {hasTrustDialogAccepted: true})' \
       "$CLAUDE_JSON" > "$CLAUDE_JSON.tmp" && mv "$CLAUDE_JSON.tmp" "$CLAUDE_JSON"
+    # As root (--root), claude refuses --dangerously-skip-permissions unless
+    # told it runs in a sandbox, which this is.
+    if [ "$(id -u)" = 0 ]; then
+      export IS_SANDBOX=1
+    fi
     exec ${claude-code}/bin/claude "$@"
   '';
   llmjail.dangerousFlag = "--dangerously-skip-permissions";
