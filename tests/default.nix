@@ -47,7 +47,6 @@ let
 
         with subtest("setup units are done and the session gate is open"):
             machine.succeed("systemctl is-active llmjail-mounts.service")
-            machine.succeed("systemctl is-active llmjail-net-filter.service")
             machine.succeed("systemctl is-active llmjail-ready.target")
 
         with subtest("sshd allows only key login as user"):
@@ -62,9 +61,17 @@ let
             output = machine.succeed("stat -c '%a %U' /etc/ssh/authorized_keys.d/user")
             assert output.strip() == "444 root", f"Unexpected mode/owner: {output}"
 
+        with subtest("network is static, with the host namespace as gateway and DNS"):
+            output = machine.succeed("ip -4 addr show eth0")
+            assert "inet 192.0.2.2/24" in output, f"Unexpected eth0 address: {output}"
+            output = machine.succeed("ip route show default")
+            assert "via 192.0.2.1" in output, f"Unexpected default route: {output}"
+            output = machine.succeed("cat /etc/resolv.conf")
+            assert "nameserver 192.0.2.1" in output, f"Unexpected resolv.conf: {output}"
+
         with subtest("sshd listens nowhere inside the guest"):
             machine.fail("systemctl is-active sshd.service")
-            tcp = [l for l in machine.succeed("ss -Htln").splitlines() if not l.split()[3].endswith(":53")]
+            tcp = machine.succeed("ss -Htln").strip()
             assert not tcp, f"Unexpected TCP listeners: {tcp}"
             output = machine.succeed("ss -Hlxp")
             assert "sshd" not in output, f"Unexpected sshd unix listener: {output}"
@@ -72,9 +79,8 @@ let
             assert output.strip() == "", f"Unexpected ssh generator sockets: {output}"
 
         with subtest("failures power the VM off"):
-            for unit in ["llmjail-mounts", "llmjail-net-filter"]:
-                output = machine.succeed(f"systemctl show -p FailureAction {unit}.service")
-                assert output.strip() == "FailureAction=poweroff-force", f"{unit}: {output}"
+            output = machine.succeed("systemctl show -p FailureAction llmjail-mounts.service")
+            assert output.strip() == "FailureAction=poweroff-force", output
             output = machine.succeed("systemctl show -p ExecStopPost llmjail-sshd.service")
             assert "poweroff" in output, f"Expected poweroff in ExecStopPost: {output}"
 
@@ -101,62 +107,6 @@ let
       '';
     };
 
-  netFilterTest = pkgs.testers.nixosTest {
-    name = "llmjail-net-filter-smoke";
-
-    nodes.machine = { lib, ... }: {
-      imports = [ ../guests/claude.nix ];
-      _module.args = { inherit nixpkgs nixpkgs-rolling claude-code codex; };
-
-      fileSystems."/.nix-lower/store" = lib.mkForce {
-        device = "tmpfs";
-        fsType = "tmpfs";
-        options = [ "size=1M" ];
-      };
-      fileSystems."/llmjail-env" = lib.mkForce {
-        device = "tmpfs";
-        fsType = "tmpfs";
-        options = [ "size=10M" ];
-      };
-
-      # Enable net filtering via kernel cmdline
-      boot.kernelParams = lib.mkAfter [ "llmjail.net_filter=1" ];
-
-      systemd.tmpfiles.rules = [
-        "d /workspace 0755 user users -"
-        "f /llmjail-env/env 0644 root root - export HOME=/home/user"
-        "f /llmjail-env/tool-args 0644 root root -"
-        "f+ /llmjail-env/allowed-domains 0644 root root - api.anthropic.com"
-      ];
-
-      systemd.services.llmjail-sshd.wantedBy = lib.mkForce [ ];
-
-      virtualisation.memorySize = 1024;
-    };
-
-    testScript = ''
-      machine.start()
-      machine.wait_for_unit("llmjail-net-filter.service")
-
-      with subtest("dnsmasq is running"):
-          machine.succeed("pgrep dnsmasq")
-
-      with subtest("resolv.conf points to localhost"):
-          output = machine.succeed("cat /etc/resolv.conf")
-          assert "127.0.0.1" in output, f"Expected 127.0.0.1 in resolv.conf: {output}"
-
-      with subtest("nftables rules are loaded"):
-          output = machine.succeed("nft list ruleset")
-          assert "llmjail_filter" in output, f"Expected llmjail_filter in nft rules: {output}"
-
-      with subtest("dnsmasq config has allowed domain"):
-          output = machine.succeed("cat /etc/dnsmasq-llmjail.conf")
-          assert "api.anthropic.com" in output, f"Expected api.anthropic.com in dnsmasq config: {output}"
-
-      with subtest("blocked domain fails to resolve"):
-          machine.fail("getent hosts evil.example.com")
-    '';
-  };
 
   # Offline: loads a locally built image instead of pulling from Docker Hub.
   dockerTestImage = pkgs.dockerTools.buildLayeredImage {
@@ -307,8 +257,6 @@ in
     guestModule = ../guests/omp.nix;
     toolBinary = pkgs.lib.getExe omp;
   };
-
-  net-filter-smoke = netFilterTest;
 
   docker-smoke = dockerTest;
 

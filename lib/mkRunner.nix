@@ -14,6 +14,7 @@ let
   arch = if pkgs.stdenv.hostPlatform.isx86_64 then "x86_64" else "aarch64";
   allowedDomains = toolDefaults.allowedDomains ++ guest.config.llmjail.extraAllowedDomains;
   share = import ./share.nix { inherit pkgs; };
+  net = import ./net.nix { inherit pkgs; };
 in
 pkgs.writeShellApplication {
   name = "llm-jail-${name}";
@@ -268,6 +269,12 @@ pkgs.writeShellApplication {
           cat "$log" >&2
         fi
       done
+      # The guest picks the names it looks up; cat -v keeps escape sequences
+      # in them from reaching the terminal.
+      if [ -f "$RUNDIR/dnsmasq.log" ]; then
+        echo "--- dnsmasq.log (last 200 lines) ---" >&2
+        tail -n 200 "$RUNDIR/dnsmasq.log" | cat -v >&2
+      fi
       if [ -f "$RUNDIR/guest.log" ]; then
         echo "--- guest.log (last 200 lines) ---" >&2
         tail -n 200 "$RUNDIR/guest.log" >&2
@@ -275,6 +282,7 @@ pkgs.writeShellApplication {
     }
 
     validate_path "$LLMJAIL_TMPDIR" "tmpdir"
+    validate_path "$(pwd)" "workspace path"
     # Named after the tool and project so it can be found once the printed
     # inspection command has scrolled away.
     PROJECT=''${PWD##*/}
@@ -302,6 +310,20 @@ pkgs.writeShellApplication {
       echo "ERROR: your user is not resolvable through nixpkgs' glibc (e.g. sssd without nscd/nsncd); the ssh client cannot run" >&2
       exit 1
     }
+
+    # The jail's boundaries live in namespaces on the host (lib/share.nix,
+    # lib/net.nix). The test mount also catches Ubuntu's AppArmor, which lets
+    # unprivileged user namespaces be created but strips their capabilities.
+    if ! unshare --user --map-current-user --keep-caps --mount -- \
+         mount -t tmpfs llmjail-check "$RUNDIR" 2>/dev/null; then
+      echo "ERROR: unprivileged user namespaces are not available; llm-jail needs them" >&2
+      echo "(on Ubuntu 23.10+: sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0)" >&2
+      exit 1
+    fi
+    if [ ! -c /dev/net/tun ]; then
+      echo "ERROR: /dev/net/tun is missing; the jail's network needs it" >&2
+      exit 1
+    fi
 
     # Only this directory is shared with the guest (envfs, at /llmjail-env).
     SHAREDIR="$RUNDIR/share"
@@ -583,7 +605,6 @@ pkgs.writeShellApplication {
       fi
     }
 
-    validate_path "$(pwd)" "workspace path"
     if [[ "$IMMUTABLE" -eq 1 ]]; then
       add_mount "$(pwd)" "$WORKSPACE_DIR" "ro-nocache" 1
     else
@@ -684,10 +705,6 @@ pkgs.writeShellApplication {
       KERNEL_PARAMS="$KERNEL_PARAMS root=tmpfs rootflags=mode=0755"
     fi
 
-    if [ "$NET_FILTER" = "1" ]; then
-      KERNEL_PARAMS="$KERNEL_PARAMS llmjail.net_filter=1"
-    fi
-
     if USER_UID=''${EUID:-$(id -u)} && [[ -n "$USER_UID" ]]; then
       KERNEL_PARAMS="$KERNEL_PARAMS llmjail.user_uid=$USER_UID"
     fi
@@ -713,6 +730,13 @@ pkgs.writeShellApplication {
       KVM_ARGS+=("-cpu" "max")
     fi
 
+    NET_ARGS=(--log "$RUNDIR/dnsmasq.log")
+    if [ "$NET_FILTER" = "1" ]; then
+      NET_ARGS+=(--allow-domains "$SHAREDIR/allowed-domains")
+    else
+      NET_ARGS+=(--unfiltered)
+    fi
+
     # The tool's terminal is an ssh session over the llmjail.ssh virtserialport,
     # which throttles instead of dropping data like virtconsole (see AGENTS.md).
     #
@@ -721,12 +745,17 @@ pkgs.writeShellApplication {
     # PL011 UART on ARM, or the second 16550A UART on x86.
     # ARM virt defaults to GICv2; max also supports hosts with GICv3-only KVM.
     #
-    # QEMU runs in its own session so a Ctrl-C to the terminal's process group
+    # QEMU runs in a network namespace whose only way out is the jail's
+    # filter (lib/net.nix).
+    #
+    # It runs in its own session so a Ctrl-C to the terminal's process group
     # does not reach it (QEMU installs its own SIGINT handler, overriding the
     # ignore bash gives background jobs). Bash runs without job control, so the
-    # job is not a group leader and setsid does not fork: $! stays QEMU's pid and
-    # the parent-death signal survives.
-    setpriv --pdeathsig KILL -- setsid -- qemu-system-${arch} \
+    # job is not a group leader and setsid does not fork. llmjail-net execs
+    # pasta, so $! is pasta's pid: pasta exits with QEMU, and QEMU dies with
+    # pasta (parent-death signal).
+    setpriv --pdeathsig KILL -- setsid -- ${net}/bin/llmjail-net "''${NET_ARGS[@]}" -- \
+      qemu-system-${arch} \
       ${lib.optionalString pkgs.stdenv.hostPlatform.isAarch64 "-machine virt,gic-version=max"} \
       "''${KVM_ARGS[@]}" \
       -m "$MEM" \
@@ -743,18 +772,19 @@ pkgs.writeShellApplication {
       -serial file:"$RUNDIR/guest.log" \
       -no-reboot \
       -device virtio-rng-pci \
-      -nic user,model=virtio-net-pci \
+      -netdev tap,id=net0,ifname=jail0,script=no,downscript=no,vhost=off \
+      -device virtio-net-pci,netdev=net0 \
       "''${SHARE_ARGS[@]}" \
       "''${DISK_ARGS[@]}" \
       </dev/null >"$RUNDIR/qemu.log" 2>&1 &
-    QEMU_PID=$!
-    cleanup_qemu() {
-      kill "$QEMU_PID" 2>/dev/null
-      wait "$QEMU_PID" 2>/dev/null
+    VM_PID=$!
+    cleanup_vm() {
+      kill "$VM_PID" 2>/dev/null
+      wait "$VM_PID" 2>/dev/null
     }
-    CLEANUP_FUNCS+=(cleanup_qemu)
+    CLEANUP_FUNCS+=(cleanup_vm)
 
-    # Registered after cleanup_qemu, so it runs first.
+    # Registered after cleanup_vm, so it runs first.
     cleanup_master() {
       jail_ssh -O exit jail 2>/dev/null || true
     }
@@ -801,12 +831,12 @@ pkgs.writeShellApplication {
     # unit powers the VM off cleanly.
     jail_ssh -O exit jail 2>/dev/null || true
     for (( i=0; i < 75; i++ )); do
-      kill -0 "$QEMU_PID" 2>/dev/null || break
+      kill -0 "$VM_PID" 2>/dev/null || break
       sleep 0.2
     done
-    if kill -0 "$QEMU_PID" 2>/dev/null; then
+    if kill -0 "$VM_PID" 2>/dev/null; then
       echo "VM did not power off within 15 s; killing it" >&2
-      kill -KILL "$QEMU_PID" 2>/dev/null || true
+      kill -KILL "$VM_PID" 2>/dev/null || true
     fi
     # ssh exits 255 after Enter ~ . and the runner passes that through.
     exit "$rc"
