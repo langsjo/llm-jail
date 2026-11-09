@@ -169,7 +169,7 @@ in
     expect = [
       "root:^tmpfs rootfs rw"
       storeOverlay
-      "share:^9p "
+      "share:^virtiofs "
     ] ++ sessionExpect;
     reject = sessionReject;
   };
@@ -177,21 +177,6 @@ in
   runner-disk = mkRunnerTest {
     name = "disk";
     runner = shell;
-    runnerArgs = [
-      "--disk"
-      "1"
-    ];
-    expect = [
-      "root:^ext4 /dev/vda rw"
-      storeOverlay
-      "share:^9p "
-    ] ++ sessionExpect;
-    reject = sessionReject;
-  };
-
-  runner-virtiofs = mkRunnerTest {
-    name = "virtiofs";
-    runner = shell.virtiofs;
     runnerArgs = [
       "--disk"
       "1"

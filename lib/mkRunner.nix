@@ -27,9 +27,9 @@ pkgs.writeShellApplication {
     pkgs.openssh
     pkgs.socat
     pkgs.sqlite
+    pkgs.virtiofsd
   ]
-  ++ (lib.optional (flags ? devenv) pkgs.devenv)
-  ++ (lib.optional (flags ? virtiofs) pkgs.virtiofsd);
+  ++ (lib.optional (flags ? devenv) pkgs.devenv);
   # The cleanup_* functions are only called indirectly, through CLEANUP_FUNCS
   # and the EXIT trap, which shellcheck cannot follow.
   excludeShellChecks = [ "SC2329" ];
@@ -38,7 +38,6 @@ pkgs.writeShellApplication {
 
     MEM="${toString toolDefaults.mem}"
     VCPU="${toString toolDefaults.vcpu}"
-    VIRTIOFS=${if flags ? virtiofs then "1" else "0"}
     DANGEROUS=0
     NIX_ENV=0
     DEVENV=0
@@ -219,7 +218,7 @@ pkgs.writeShellApplication {
       exit 1
     fi
 
-    # Paths used in virtfs option strings (comma-separated) and kernel cmdline
+    # Paths used in QEMU option strings (comma-separated) and kernel cmdline
     # (space-separated) cannot contain commas, spaces, or colons (mount spec delimiter),
     # nor '%', which ssh expands in ssh_config values.
     validate_path() {
@@ -466,44 +465,32 @@ pkgs.writeShellApplication {
     SHARE_ARGS=()
     MASK_ROOTS=()
 
-    if [ "$VIRTIOFS" = "1" ]; then
-      # One virtiofsd per share (it serves a single directory), started as
-      # the invoking user - no root needed. --sandbox=namespace pivot_roots
-      # into the share inside an unprivileged user namespace, so symlinks
-      # cannot escape it. That namespace only maps our own uid/gid, so
-      # every guest uid/gid is squashed to ours (like 9p's
-      # security_model=none) and host files we don't own (root's /nix/store
-      # shows up as the overflow id 65534) are reported to the guest as root.
-      HOST_UID=$(id -u)
-      HOST_GID=$(id -g)
-      VIRTIOFSD_PIDS=()
-      cleanup_virtiofsd() {
-        kill "''${VIRTIOFSD_PIDS[@]+"''${VIRTIOFSD_PIDS[@]}"}" 2>/dev/null
-      }
-      CLEANUP_FUNCS+=(cleanup_virtiofsd)
+    # One virtiofsd per share (it serves a single directory), started as
+    # the invoking user - no root needed. --sandbox=namespace pivot_roots
+    # into the share inside an unprivileged user namespace, so symlinks
+    # cannot escape it. That namespace only maps our own uid/gid, so
+    # every guest uid/gid is squashed to ours and host files we don't own
+    # (root's /nix/store shows up as the overflow id 65534) are reported to
+    # the guest as root.
+    HOST_UID=$(id -u)
+    HOST_GID=$(id -g)
+    VIRTIOFSD_PIDS=()
+    cleanup_virtiofsd() {
+      kill "''${VIRTIOFSD_PIDS[@]+"''${VIRTIOFSD_PIDS[@]}"}" 2>/dev/null
+    }
+    CLEANUP_FUNCS+=(cleanup_virtiofsd)
 
-      # vhost-user needs guest RAM in shared memory so virtiofsd can map it
-      SHARE_ARGS+=(
-        "-object" "memory-backend-memfd,id=mem,size=''${MEM}M,share=on"
-        "-machine" "memory-backend=mem"
-      )
-    fi
+    # vhost-user needs guest RAM in shared memory so virtiofsd can map it
+    SHARE_ARGS+=(
+      "-object" "memory-backend-memfd,id=mem,size=''${MEM}M,share=on"
+      "-machine" "memory-backend=mem"
+    )
 
     # Exports HOSTPATH to the guest under TAG by appending QEMU args to
     # SHARE_ARGS. MODE is rw, ro, ro-nocache, or ro-immutable (contents never
     # change during the run, e.g. envfs).
     add_share() {
       local tag="$1" hostpath="$2" mode="$3"
-
-      if [ "$VIRTIOFS" != "1" ]; then
-        # Caching for 9p is chosen guest-side by the mount options
-        local virtfs="local,path=$hostpath,security_model=none,mount_tag=$tag"
-        if [ "$mode" != "rw" ]; then
-          virtfs="$virtfs,readonly=on"
-        fi
-        SHARE_ARGS+=("-virtfs" "$virtfs")
-        return
-      fi
 
       local sock="$RUNDIR/virtiofsd-$tag.sock"
       local args=(
@@ -586,12 +573,12 @@ pkgs.writeShellApplication {
     MASK_ROOTS+=("$WORKSPACE_DIR")
 
     validate_path "$STATE_DIR" "state directory"
-    # 9p/virtiofs refuse to share a non-existent path; first run starts empty and
+    # virtiofsd refuses to share a non-existent path; first run starts empty and
     # the tool goes through its login/onboarding flow inside the jail.
     mkdir -p "$STATE_DIR"
     add_mount "$STATE_DIR" "/home/user/${toolDefaults.configDirName}" "rw"
 
-    # Copy .gitconfig into the envfs share (9p/virtiofs can't mount single files)
+    # Copy .gitconfig into the envfs share (virtiofs can't mount single files)
     if [ -f "$HOME/.gitconfig" ]; then
       cp "$HOME/.gitconfig" "$SHAREDIR/.gitconfig"
     fi

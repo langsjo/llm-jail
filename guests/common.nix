@@ -1,26 +1,14 @@
 { config, lib, pkgs, nixpkgs-rolling, ... }:
 
 let
-  # Read-only boot-time share (store lower layer, envfs). With virtiofs,
-  # caching is chosen host-side by virtiofsd's --cache.
-  # 9p: msize=1M because the 8KB default round-trips every
-  # read/readdir/stat beyond it, crippling metadata-heavy tool I/O.
-  # cache=loose enables client readahead; cache=none serializes every read
-  # request-by-request, which made installing the multi-MB nix db snapshot
-  # from envfs take seconds.
+  # Read-only boot-time share (store lower layer, envfs). Caching is chosen
+  # host-side by virtiofsd's --cache.
   roBootShare = device: {
     inherit device;
-    fsType = if config.llmjail.virtiofs then "virtiofs" else "9p";
-    # A 9p/virtiofs mount has no device unit to wait for, and it fails if udev has
+    fsType = "virtiofs";
+    # A virtiofs mount has no device unit to wait for, and it fails if udev has
     # not bound the virtio device yet, which drops the initrd into emergency mode.
-    options =
-      [ "x-systemd.after=systemd-udev-settle.service" ]
-      ++ (
-        if config.llmjail.virtiofs then
-          [ "ro" ]
-        else
-          [ "trans=virtio" "version=9p2000.L" "cache=loose" "msize=1048576" "ro" ]
-      );
+    options = [ "x-systemd.after=systemd-udev-settle.service" "ro" ];
     neededForBoot = true;
   };
 in
@@ -94,11 +82,6 @@ in
         exec ${config.llmjail.toolBinary} "''${ARGS[@]}"
       '';
     };
-    virtiofs = lib.mkOption {
-      type = lib.types.bool;
-      default = false;
-      description = "Mount host shares with virtiofs instead of 9p (set by the `virtiofs` build-time argument)";
-    };
   };
 
   config = {
@@ -112,14 +95,12 @@ in
       "systemd.ssh_auto=no"
     ];
     boot.initrd.availableKernelModules = [
-      "9p"
-      "9pnet_virtio"
       "virtio_pci"
       "virtio_blk"
       "virtio_net"
       "virtio_rng"
-    ]
-    ++ lib.optional config.llmjail.virtiofs "virtiofs";
+      "virtiofs"
+    ];
     # Force-load overlay in initrd: availableKernelModules only allows
     # autoload, but the systemd-initrd path doesn't always trigger it for
     # `mount -t overlay`, so make it explicit.
@@ -239,7 +220,7 @@ in
     };
 
     # Parses kernel cmdline for llmjail.mounts=tag0:/path:rw,tag1:/path:ro,...
-    # and mounts each entry via 9p or virtiofs (build-time `virtiofs` arg).
+    # and mounts each entry via virtiofs.
     systemd.services.llmjail-mounts = {
       description = "Mount llmjail host shares from kernel cmdline";
       wantedBy = [ "multi-user.target" ];
@@ -282,22 +263,12 @@ in
           echo "Mounting $tag -> $mpath ($mode)"
           ${pkgs.coreutils}/bin/mkdir -p "$mpath"
 
-          ${if config.llmjail.virtiofs then ''
-            # Caching is set host-side per share (virtiofsd --cache)
-            OPTS="rw"
-            if [ "$mode" = "ro" ] || [ "$mode" = "ro-nocache" ]; then
-              OPTS="ro"
-            fi
-            ${pkgs.util-linux}/bin/mount -t virtiofs "$tag" "$mpath" -o "$OPTS"
-          '' else ''
-            OPTS="trans=virtio,version=9p2000.L,cache=mmap,msize=1048576"
-            if [ "$mode" = "ro" ]; then
-              OPTS="$OPTS,ro"
-            elif [ "$mode" = "ro-nocache" ]; then
-              OPTS="trans=virtio,version=9p2000.L,cache=none,msize=1048576,ro"
-            fi
-            ${pkgs.util-linux}/bin/mount -t 9p "$tag" "$mpath" -o "$OPTS"
-          ''}
+          # Caching is set host-side per share (virtiofsd --cache)
+          OPTS="rw"
+          if [ "$mode" = "ro" ] || [ "$mode" = "ro-nocache" ]; then
+            OPTS="ro"
+          fi
+          ${pkgs.util-linux}/bin/mount -t virtiofs "$tag" "$mpath" -o "$OPTS"
 
           # Fix ownership for paths under /home/user
           case "$mpath" in
@@ -308,7 +279,7 @@ in
         done
 
         # Copy dotfiles provided via envfs (can't mount individual files via
-        # 9p/virtiofs). Currently just .gitconfig, placed there by mkRunner.
+        # virtiofs). Currently just .gitconfig, placed there by mkRunner.
         for src in /llmjail-env/.*; do
           [ -f "$src" ] || continue
           name="''${src##*/}"

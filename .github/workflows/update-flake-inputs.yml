@@ -67,7 +67,7 @@ jobs:
         if: steps.update.outputs.update_available == 'true'
         run: |
           nix eval .#packages.x86_64-linux --apply builtins.attrNames --json \
-            | jq -r '.[] | ".#packages.x86_64-linux.\(.).virtiofs"' > /tmp/packages.txt
+            | jq -r '.[] | ".#packages.x86_64-linux.\(.)"' > /tmp/packages.txt
           mapfile -t packages < /tmp/packages.txt
 
           nix run github:langsjo/nix-build-substitutable \
@@ -78,7 +78,7 @@ jobs:
         if: steps.update.outputs.update_available == 'true'
         run: nix flake check --print-build-logs
 
-      - name: Build packages with virtiofs
+      - name: Build packages
         if: steps.update.outputs.update_available == 'true'
         run: |
           mapfile -t packages < /tmp/packages.txt
