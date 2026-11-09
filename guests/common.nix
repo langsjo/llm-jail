@@ -445,6 +445,17 @@ in
     systemd.services."serial-getty@ttyS1".enable = false;
     systemd.services."getty@tty1".enable = false;
 
+    # No display (QEMU runs with -nodefaults), so no keymap or font to set up.
+    # systemd-vconsole-setup only started once udev had worked through the
+    # console devices, and sysinit.target, which everything after waits on,
+    # waited for it.
+    console.enable = false;
+    # The root filesystem is new on every boot, so these ran every time for
+    # nothing: the journal message catalog rebuild, and login records.
+    systemd.services.systemd-journal-catalog-update.enable = false;
+    systemd.services.systemd-update-utmp.enable = false;
+    systemd.services.systemd-update-utmp-runlevel.enable = false;
+
     documentation.enable = false;
     nix.settings.experimental-features = [ "nix-command" "flakes" ];
     nix.settings.sandbox = false;
