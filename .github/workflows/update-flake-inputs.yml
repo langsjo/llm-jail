@@ -33,8 +33,7 @@ jobs:
         env:
           ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
         run: |
-          nix profile add --impure --expr \
-            "(builtins.getFlake (toString ./.)).inputs.nixpkgs.legacyPackages.$(uname -m)-linux.attic-client"
+          nix profile add --inputs-from . nixpkgs#attic-client
           attic login main https://cache.langsjo.dev "$ATTIC_TOKEN"
           attic use main
 
