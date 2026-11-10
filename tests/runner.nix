@@ -110,7 +110,8 @@ let
   # Tries to read masked paths and to write the files host git executes.
   # As root it also unmounts them and mounts the workspace share a second
   # time, and tries everything again through that mount. Prints
-  # "<check>: held" or "<check>: BYPASSED", then whether git still commits.
+  # "<check>: held" or "<check>: BYPASSED", then whether git still works,
+  # also in libs/, which is pinned (it holds a submodule) but has no .git.
   protectProbe = pkgs.writeShellScript "llmjail-probe-protect" ''
     t() {
       if eval "$2" >/dev/null 2>&1; then echo "$1: BYPASSED"; else echo "$1: held"; fi
@@ -124,6 +125,10 @@ let
         done
         mkdir -p /mnt/again
         mount -t virtiofs mount0 /mnt/again
+        # The checks below only mean something if this is the workspace.
+        if [ -e /mnt/again/.git/HEAD ] && [ -d /mnt/again/libs/sub-repo ]; then
+          echo "second mount shows the workspace: ok"
+        fi
         roots+=(/mnt/again)
       fi
       for root in "''${roots[@]}"; do
@@ -135,12 +140,15 @@ let
         t "$root write config" 'echo "[core] fsmonitor = touch /tmp/pwned" >> $root/.git/config'
         t "$root replace config" 'cp $root/.git/config $root/c && mv $root/c $root/.git/config'
         t "$root write hook" 'echo "touch /tmp/pwned" > $root/.git/hooks/pre-commit'
-        t "$root write submodule config" 'echo x >> $root/.git/modules/sub-repo/config'
-        t "$root write submodule hook" 'touch $root/.git/modules/sub-repo/hooks/post-checkout'
+        t "$root write submodule config" 'echo x >> $root/.git/modules/libs/sub-repo/config'
+        t "$root write submodule hook" 'touch $root/.git/modules/libs/sub-repo/hooks/post-checkout'
+        t "$root rename gitdir" 'mv $root/.git $root/.git-old'
+        t "$root write submodule .git file" 'echo "gitdir: /tmp" > $root/libs/sub-repo/.git'
       done
       ${pkgs.git}/bin/git config --global safe.directory '*'
       ${pkgs.git}/bin/git -C /workspace -c user.name=t -c user.email=t@t \
         commit -q --allow-empty -m from-the-jail && echo "commit: ok"
+      ${pkgs.git}/bin/git -C /workspace/libs status --short > /dev/null && echo "git in libs: ok"
     } > /workspace/protect-checks
     exit 0
   '';
@@ -149,7 +157,7 @@ let
   # Run as user and as root; root additionally rewrites its own network
   # setup, which must change nothing.
   networkProbe =
-    { internet, evil }:
+    { internet, evil, host }:
     pkgs.writeShellScript "llmjail-probe-network" ''
       curl() { ${pkgs.curl}/bin/curl "$@"; }
       t() {
@@ -165,6 +173,10 @@ let
         # not a leak.
         t host-loopback-via-gateway 'curl -s -m3 http://${internet}:8080/ | grep -q HOSTLOOPBACK'
         t host-loopback-via-namespace 'curl -s -m3 http://192.0.2.1:8080/ | grep -q HOSTLOOPBACK'
+        # A host service on every address: through the host's own address
+        # (which pasta copies into the namespace) and through one it does not.
+        t host-address 'curl -s -m3 http://${host}:8081/ | grep -q HOSTSERVICE'
+        t host-other-address 'curl -s -m3 http://10.99.0.1:8081/ | grep -q HOSTSERVICE'
         t metadata 'curl -sf -m3 http://169.254.169.254/'
         # Checked on the internet node: this never fails on the sending side.
         echo udp-leak | ${pkgs.socat}/bin/socat -u - UDP:${internet}:9999
@@ -471,6 +483,16 @@ in
     expect = [ "must not contain '%'" ];
   };
 
+  # `#` would allow every domain in dnsmasq's /DOMAIN/ syntax.
+  runner-reject-bad-domain = mkPrebootTest {
+    name = "reject-bad-domain";
+    runnerArgs = [
+      "--allow-domain"
+      "#"
+    ];
+    expect = [ "--allow-domain '#' is not a domain name" ];
+  };
+
   runner-reject-long-tmpdir = mkPrebootTest {
     name = "reject-long-tmpdir";
     setup = ''
@@ -557,13 +579,13 @@ in
         git init -q -b main .
         git init -q -b main ../sub-src
         git -C ../sub-src -c user.name=t -c user.email=t@t commit -q --allow-empty -m sub
-        git -c protocol.file.allow=always submodule -q add ../sub-src sub-repo
+        git -c protocol.file.allow=always submodule -q add ../sub-src libs/sub-repo
         git -c user.name=t -c user.email=t@t commit -q -m init
         echo secret > .env
         mkdir -p sub secrets
         echo secret > sub/.env
         echo secret > secrets/key
-        sha256sum .git/config .git/modules/sub-repo/config > ~/before
+        sha256sum .git/config .git/modules/libs/sub-repo/config libs/sub-repo/.git > ~/before
       """
 
       def check_protected(args, expected_checks):
@@ -573,18 +595,31 @@ in
           assert "BYPASSED" not in checks, checks
           assert checks.count(": held") == expected_checks, f"not every check ran:\n{checks}"
           assert "commit: ok" in checks, f"git commit failed in the jail:\n{checks}"
+          assert "git in libs: ok" in checks, f"git failed in a pinned directory:\n{checks}"
           # The host's copies are untouched, and the jail's commit is there.
           host.succeed("cd ~alice/ws && sha256sum -c --quiet ~alice/before")
           host.succeed("grep -qx secret ~alice/ws/.env ~alice/ws/sub/.env ~alice/ws/secrets/key")
-          host.fail("find ~alice/ws/.git/hooks ~alice/ws/.git/modules/sub-repo/hooks -type f ! -name '*.sample' | grep .")
+          host.fail("find ~alice/ws/.git/hooks ~alice/ws/.git/modules/libs/sub-repo/hooks -type f ! -name '*.sample' | grep .")
           host.succeed("su - alice -c 'git -C ~/ws log --format=%s' | grep -qx from-the-jail")
 
       with subtest("masks and git files hold"):
-          check_protected("", 10)
+          check_protected("", 12)
 
       with subtest("masks and git files hold against root, also through a second mount"):
-          check_protected("--root", 20)
+          check_protected("--root", 24)
+          assert "second mount shows the workspace: ok" in ws("protect-checks"), "the second mount is not the workspace"
           assert ws("uid").strip() == "0", "the session did not run as root"
+
+      with subtest("a hooks directory reached through a symlink stops the run before boot"):
+          log = jail("${protectProbe}", expect_exit=1, setup="""
+            git init -q .
+            mkdir tools
+            mv .git/hooks tools/hooks
+            ln -s ../tools/hooks .git/hooks
+          """)
+          expect(log, "the file server did not start", "runner output")
+          expect(log, "hooks goes through a symlink inside the share", "runner output")
+          reject(log, "Booting VM", "runner output")
     '';
   };
 
@@ -603,13 +638,26 @@ in
           wantedBy = [ "multi-user.target" ];
           script = "${pkgs.socat}/bin/socat TCP-LISTEN:8080,bind=127.0.0.1,fork,reuseaddr SYSTEM:'echo HTTP/1.0 200 OK; echo; echo HOSTLOOPBACK'";
         };
+        # A service on every host address, and an address pasta does not copy
+        # into the namespace (like docker0's or a VPN's).
+        systemd.services.host-service = {
+          wantedBy = [ "multi-user.target" ];
+          path = [ pkgs.iproute2 ];
+          preStart = ''
+            ip link add other0 type dummy
+            ip addr add 10.99.0.1/32 dev other0
+            ip link set other0 up
+          '';
+          script = "${pkgs.socat}/bin/socat TCP-LISTEN:8081,fork,reuseaddr SYSTEM:'echo HTTP/1.0 200 OK; echo; echo HOSTSERVICE'";
+        };
       };
     testScript =
       { nodes, ... }:
       let
         internet = nodes.internet.networking.primaryIPAddress;
+        host = nodes.host.networking.primaryIPAddress;
         probe = networkProbe {
-          inherit internet;
+          inherit internet host;
           evil = "192.168.1.200";
         };
       in
@@ -618,6 +666,7 @@ in
         internet.wait_for_unit("nginx.service")
         internet.wait_for_unit("udp-sink.service")
         host.wait_for_unit("host-loopback.service")
+        host.wait_for_unit("host-service.service")
 
         # Positive controls: from the host itself, everything the guest is
         # denied is reachable, so a closed result below is the jail's doing.
@@ -625,6 +674,8 @@ in
         host.succeed("curl -sf http://evil.test/")
         host.succeed("curl -sf http://169.254.169.254/")
         host.succeed("curl -s http://127.0.0.1:8080/ | grep -q HOSTLOOPBACK")
+        host.succeed("curl -s http://${host}:8081/ | grep -q HOSTSERVICE")
+        host.succeed("curl -s http://10.99.0.1:8081/ | grep -q HOSTSERVICE")
         host.succeed("echo udp-control | socat -u - UDP:${internet}:9999")
         internet.wait_until_succeeds("grep -q udp-control /tmp/udp-received", timeout=30)
 
@@ -647,6 +698,8 @@ in
         closed_always = {
             "host-loopback-via-gateway": "closed",
             "host-loopback-via-namespace": "closed",
+            "host-address": "closed",
+            "host-other-address": "closed",
             "metadata": "closed",
         }
         filtered = {
