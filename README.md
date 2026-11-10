@@ -250,7 +250,23 @@ The shell tool honors `$SHELL` (resolved through symlinks so the `/nix/store` pa
 
 All other host paths are invisible to the guest. Changes outside mounted directories are lost when the VM shuts down.
 
-**Files host git executes.** Host git runs code named in a repository's config (`core.hooksPath`, `core.fsmonitor`, `core.sshCommand`, filter drivers) and its hooks. In every writable share that is a git repository, these are read-only in the jail: `.git/config`, `.git/config.worktree`, `.git/hooks` (created empty if missing), the same in each submodule's gitdir under `.git/modules`, and `.git/worktrees/*/config.worktree` (also when `.git` is a `gitdir:` file pointing inside the share). Commits, branches and other git work still happen in the jail; commands that write `.git/config` (`git remote add`, `git push -u`, setting an upstream) fail there with "Read-only file system". Not covered: other repositories nested inside the workspace, and repositories the agent creates; don't run host git in those.
+**Files host git executes.** Host git runs code named in config files (`core.hooksPath`, `core.fsmonitor`, `core.sshCommand`, filter drivers), from its hooks, and from wherever control files (`commondir`, `.git` files) point it. In every writable share, these are read-only in the jail:
+
+- in the share's own gitdir (also when `.git` is a `gitdir:` file pointing inside the share), in each submodule's gitdir under `.git/modules`, and in each linked worktree's `.git/worktrees/*`: `config`, `config.worktree` (created empty if missing while `extensions.worktreeConfig` is on), `commondir` and `hooks` (created empty if missing)
+- every `.git` file in the share (submodule checkouts, linked worktrees)
+- for the share root and each of those checkouts: the hooks directory git resolves, so also a `core.hooksPath` inside the share, such as `.husky/` or a relative path from your global config (created empty if missing), and every config file git loads from inside the share, including `include.path` targets
+
+Each gitdir, and every directory between the share root and a protected path, is pinned: the agent cannot rename or remove it and put a copy in its place, while everything in it stays writable. So commits, branches and checkouts work in the jail. What fails there with "Read-only file system" or "Device or resource busy": commands that write `.git/config` (`git remote add`, `git push -u`, setting an upstream), editing the hooks above, and renaming or removing a gitdir, a submodule checkout or a directory that contains one.
+
+The runner refuses to start when a protected path goes through a symlink inside the share (for example `.git/hooks -> ../tools/hooks`; use `core.hooksPath` instead), since the agent could point the link elsewhere, and when an `include.path` names a file inside the share that does not exist, since the agent could create it.
+
+> [!WARNING]
+> This does not make host git safe in a workspace the agent wrote. Still possible:
+> - a new `.git/commondir` that points git at a gitdir with the agent's config (a missing file cannot be protected, and git refuses an empty placeholder)
+> - a gitlink the agent adds to the index, next to a repository it planted: a top-level `git status` runs git in it
+> - any repository the agent creates or changes elsewhere in the workspace, which runs its config when you use git inside it
+>
+> In such a workspace, run git inside the jail, or first look without git for what it would follow: `find . -name .git -o -name commondir` shows planted repositories and redirects.
 
 #### Masks
 
@@ -259,6 +275,8 @@ All other host paths are invisible to the guest. Changes outside mounted directo
 - paths created after the VM started (the patterns are expanded once, at startup)
 - symlinks (skipped with a message), and other hard links to a masked file
 - contents reachable another way, such as git history (`git show HEAD:.env` for a tracked file)
+
+Masks and protected git files are found first and mounted after, and a mount follows symlinks. An agent in a second jail already running on the same workspace could swap a path for a symlink in between and move a mask or a read-only bind elsewhere. Don't start a jail on a workspace another jail's agent is writing.
 
 On NixOS hosts, system packages (`/run/current-system/sw`) and user packages (`/etc/profiles/per-user/$USER`) are automatically mounted and added to PATH, so tools like `jj`, `ripgrep`, etc. are available without hardcoding them in the guest.
 
@@ -280,7 +298,9 @@ All other host environment variables are stripped.
 - Additional domains can be added with `--allow-domain` (subdomains are included automatically)
 - Use `--no-net-filter` to lift the restrictions
 
-Filtered or not, the guest can never reach the host's loopback (`127.0.0.0/8`, including services on host `localhost`), link-local addresses (`169.254.0.0/16`, e.g. cloud metadata endpoints), `0.0.0.0/8`, or multicast and reserved ranges.
+Filtered or not, the guest can never reach the host's loopback (`127.0.0.0/8`, including services on host `localhost`), the host's other IPv4 addresses (taken at startup, so an address the host gains later, e.g. a VPN coming up, is not covered), link-local addresses (`169.254.0.0/16`, e.g. cloud metadata endpoints), `0.0.0.0/8`, or multicast and reserved ranges.
+
+`--allow-domain` takes plain domain names only. A base URL whose host is `localhost` or an IP address is not allowlisted (the runner warns): the filter allows names, and loopback is always blocked.
 
 Default allowed domains per tool:
 

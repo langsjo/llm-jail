@@ -285,8 +285,20 @@ pkgs.writeShellApplication {
       done
     }
 
+    # Allowlist entries become dnsmasq --server=/DOMAIN/ and --nftset=/DOMAIN/
+    # options, where `#` means every domain and `/` ends the domain list.
+    valid_domain() {
+      [[ "$1" =~ ^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$ ]]
+    }
+
     validate_path "$LLMJAIL_TMPDIR" "tmpdir"
     validate_path "$(pwd)" "workspace path"
+    for d in "''${EXTRA_DOMAINS[@]+"''${EXTRA_DOMAINS[@]}"}"; do
+      if ! valid_domain "$d"; then
+        echo "ERROR: --allow-domain '$d' is not a domain name (letters, digits, '-', '_', separated by single dots)" | cat -v >&2
+        exit 1
+      fi
+    done
     # Named after the tool and project so it can be found once the printed
     # inspection command has scrolled away.
     PROJECT=''${PWD##*/}
@@ -390,14 +402,19 @@ pkgs.writeShellApplication {
       {
         ${builtins.concatStringsSep "\n    " (map (d: "echo \"${d}\"") allowedDomains)}
 
-        # Auto-extract domains from base URL env vars
+        # Auto-extract domains from base URL env vars. The filter allows
+        # names, so a loopback or IP-literal host can never be reached.
         for var in ANTHROPIC_BASE_URL OPENAI_BASE_URL; do
           val="''${!var:-}"
           if [ -n "$val" ]; then
             domain="''${val#*://}"
             domain="''${domain%%/*}"
             domain="''${domain%%:*}"
-            if [ -n "$domain" ]; then
+            if [ "$domain" = localhost ] || [[ "$domain" =~ ^[0-9.]+$ ]] || [[ "$domain" == \[* ]]; then
+              echo "WARNING: $var points at $domain, which the jail's network filter cannot allow (loopback is always blocked; for other addresses use --no-net-filter)" | cat -v >&2
+            elif ! valid_domain "$domain"; then
+              echo "WARNING: $var has no usable host name ('$domain'); not added to the allowlist" | cat -v >&2
+            else
               echo "$domain"
             fi
           fi
@@ -557,7 +574,11 @@ pkgs.writeShellApplication {
       # virtiofsd turns host mount points into guest automounts, which
       # overlayfs rejects in its lower layer (EREMOTE). A Nix build sandbox
       # bind-mounts every store path, so the guest couldn't even find its init.
-      if [ "$tag" = "nix-store" ]; then
+      # In user shares, llmjail-share's binds would become guest filesystem
+      # boundaries: git stops discovering a repository at them, and a second
+      # mount of the tag would reuse a submount's superblock as its root.
+      # virtiofsd still serves through the binds, so they hold either way.
+      if [ "$tag" = "nix-store" ] || [ "$protect" = 1 ]; then
         args+=("--no-announce-submounts")
       fi
       # Logged to a file, not the terminal: the tool's session owns the tty
@@ -570,19 +591,24 @@ pkgs.writeShellApplication {
         virtiofsd "''${args[@]}" 2>"$log" &
       VIRTIOFSD_PIDS+=($!)
 
-      # QEMU fails outright if the socket isn't there yet
+      # QEMU fails outright if the socket isn't there yet. llmjail-share first
+      # walks the share (masks, .git files), which takes a while in a large
+      # one, so it gets up to a minute; it exits at once when it refuses to
+      # start.
       local i
-      for (( i=0; i < 100; i++ )); do
+      for (( i=0; i < 1200; i++ )); do
         [ -S "$sock" ] && break
+        kill -0 "''${VIRTIOFSD_PIDS[-1]}" 2>/dev/null || break
         sleep 0.05
       done
       if [ ! -S "$sock" ]; then
-        echo "ERROR: virtiofsd did not start for $hostpath (ensure unprivileged user namespaces are allowed):" >&2
+        echo "ERROR: the file server did not start for $hostpath:" >&2
         cat -v "$log" >&2
         exit 1
       fi
-      # e.g. a --mask that matched a symlink
-      grep '^llmjail-share: ' "$log" >&2 || true
+      # e.g. a --mask that matched a symlink. Paths come from the workspace,
+      # which the agent writes, so cat -v keeps escape sequences inert.
+      grep '^llmjail-share: ' "$log" | cat -v >&2 || true
 
       SHARE_ARGS+=(
         "-chardev" "socket,id=fs-$tag,path=$sock"

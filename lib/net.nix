@@ -30,6 +30,17 @@ pkgs.writeShellApplication {
     util-linux
   ];
   text = ''
+    # Inside the namespace, the re-executed helper gets a private first
+    # argument (rather than an environment variable, which the caller's
+    # environment could already carry) and the host's addresses.
+    IN_NAMESPACE=0
+    HOST_ADDRESSES=
+    if [ "''${1:-}" = --in-namespace ]; then
+      IN_NAMESPACE=1
+      HOST_ADDRESSES=$2
+      shift 2
+    fi
+
     ALLOW_DOMAINS=
     UNFILTERED=0
     LOG=
@@ -48,18 +59,23 @@ pkgs.writeShellApplication {
       exit 1
     fi
 
-    if [ "''${LLMJAIL_NET_NS:-}" != 1 ]; then
+    if [ "$IN_NAMESPACE" = 0 ]; then
+      # Connections pasta makes for the namespace come from the host itself,
+      # so they would reach host services on any host address. Only those
+      # pasta copies into the namespace are local there (refused by the
+      # input chain); the rest go into the blocked set. Addresses the host
+      # gains later are not covered.
+      HOST_ADDRESSES=$(ip -4 -o addr show | while read -r _ _ _ cidr _; do echo "''${cidr%/*}"; done | paste -sd, -)
       # pasta's defaults would let the namespace reach host loopback: through
       # the gateway address (--no-map-gw) and through host ports forwarded
       # into its own loopback (-T, -U). Nothing is forwarded inward (-t, -u).
       # pasta exits with QEMU and passes its exit status through.
-      LLMJAIL_NET_NS=1 exec pasta --config-net --foreground --quiet \
+      exec pasta --config-net --foreground --quiet \
         --tcp-ports none --udp-ports none --tcp-ns none --udp-ns none \
         --no-map-gw \
         --dns-forward ${addr.dnsForward} \
-        -- "$0" "''${ARGS[@]}"
+        -- "$0" --in-namespace "$HOST_ADDRESSES" "''${ARGS[@]}"
     fi
-    unset LLMJAIL_NET_NS
 
     ip link set lo up
     # Owned by uid 0 here, so QEMU can attach to it after dropping every capability.
@@ -76,6 +92,11 @@ pkgs.writeShellApplication {
       GUEST_ACCEPT='ip daddr @allowed tcp dport { 80, 443 } accept'
     fi
 
+    BLOCKED_HOST=
+    if [ -n "$HOST_ADDRESSES" ]; then
+      BLOCKED_HOST=", $HOST_ADDRESSES"
+    fi
+
     # Guest traffic passes the forward chain (and the input chain for DNS);
     # dnsmasq's upstream queries are this namespace's only output.
     nft -f - <<NFT
@@ -88,11 +109,13 @@ pkgs.writeShellApplication {
       }
       # Never reachable from the guest, filtered or not: "this network",
       # loopback, link-local (cloud metadata, pasta's DNS forwarder),
-      # multicast and reserved.
+      # multicast and reserved, and the host's own addresses.
       set blocked {
         type ipv4_addr
         flags interval
-        elements = { 0.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 224.0.0.0/3 }
+        # The host addresses may overlap the ranges (127.0.0.1).
+        auto-merge
+        elements = { 0.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 224.0.0.0/3$BLOCKED_HOST }
       }
       # The guest may only ask dnsmasq. This also covers the host addresses
       # pasta copies into this namespace, which are local here.
@@ -130,6 +153,12 @@ pkgs.writeShellApplication {
     else
       while IFS= read -r domain || [ -n "$domain" ]; do
         [ -z "$domain" ] && continue
+        # In dnsmasq's /DOMAIN/ syntax `#` means every domain and `/` ends
+        # the list, so only plain names get through.
+        if [[ ! "$domain" =~ ^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$ ]]; then
+          echo "llmjail-net: not a domain name: $domain" | cat -v >&2
+          exit 1
+        fi
         DNSMASQ_ARGS+=(
           "--server=/$domain/${addr.dnsForward}"
           "--nftset=/$domain/4#inet#llmjail#allowed"
