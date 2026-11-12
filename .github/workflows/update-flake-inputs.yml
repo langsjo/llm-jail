@@ -75,7 +75,15 @@ jobs:
 
       - name: Run flake checks
         if: steps.update.outputs.update_available == 'true'
-        run: nix flake check --print-build-logs
+        # Skips the tests that boot a jail: on GitHub's runners the jail is a
+        # third nested VM, which never becomes ready
+        run: |
+          nix eval .#checks.x86_64-linux --apply builtins.attrNames --json \
+            | jq -r '.[]
+                | select(IN("runner-boot", "runner-rc", "runner-protect", "runner-network", "runner-lifecycle") | not)
+                | ".#checks.x86_64-linux.\(.)"' > /tmp/checks.txt
+          mapfile -t checks < /tmp/checks.txt
+          nix build "${checks[@]}" --no-link --print-build-logs
 
       - name: Build packages
         if: steps.update.outputs.update_available == 'true'
